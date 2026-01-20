@@ -10,12 +10,12 @@ dotpak diff backup.tar.gz -v     # see what changed
 
 ## Features
 
-📦 **Two-tier backup** — regular configs always, secrets only with encryption
-🔐 **age & GPG** — modern encryption with automatic detection
-🍺 **Homebrew/apt/Go** — backs up and restores your package lists
-📅 **Scheduled backups** — launchd on macOS, cron on Linux
-🎯 **Selective restore** — restore by category (shell, editor, cloud, etc.)
-🔍 **Diff & verify** — compare archives with current files, check integrity
+- 📦 **Two-tier backup** — regular configs always, secrets only with encryption
+- 🔐 **age & GPG** — modern encryption with automatic detection
+- 🍺 **Homebrew/apt/Go** — backs up and restores your package lists
+- 📅 **Scheduled backups** — launchd on macOS, cron on Linux
+- 🎯 **Selective restore** — restore by category (shell, editor, cloud, etc.)
+- 🔍 **Diff & verify** — compare archives with current files, check integrity
 
 ## Installation
 
