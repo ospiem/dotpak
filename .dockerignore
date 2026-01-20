@@ -1,0 +1,7 @@
+dotpak
+*.tar.gz
+*.tar.gz.age
+*.tar.gz.gpg
+coverage.out
+coverage.html
+.git
