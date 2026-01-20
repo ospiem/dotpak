@@ -87,7 +87,6 @@ Uses launchd on macOS, cron on Linux.
 
 - **Pre-restore backup** — before restoring, dotpak saves existing files to a safety archive
 - **Encryption preserved** — safety backups are encrypted if the source was
-- **Checksums** — every archive includes SHA256 verification
 
 ## License
 
