@@ -83,6 +83,24 @@ dotpak cron uninstall           # remove
 
 Uses launchd on macOS, cron on Linux.
 
+### macOS App Bundle
+
+On macOS, scheduled backups may require **Full Disk Access** permission if your backup directory is in a protected location. The app bundle provides a way to grant this permission.
+
+**Download** from [Releases](https://github.com/ospiem/dotpak/releases) (file `Dotpak-vX.X.X-darwin-*.app.tar.gz`)
+
+**Or build locally:**
+
+```bash
+make app-bundle   # creates Dotpak.app
+```
+
+**Grant Full Disk Access:**
+
+1. Open **System Settings** → **Privacy & Security** → **Full Disk Access**
+2. Click **+** and add `Dotpak.app`
+3. Reinstall cron: `dotpak cron uninstall && dotpak cron install`
+
 ## Safety
 
 - **Pre-restore backup** — before restoring, dotpak saves existing files to a safety archive
