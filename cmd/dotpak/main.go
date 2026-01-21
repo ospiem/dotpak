@@ -2,6 +2,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"os"
@@ -766,7 +768,7 @@ func uninstallCron(out *output.Output) error {
 }
 
 func cronBackupArgs(execPath string) []string {
-	args := []string{execPath, "backup"}
+	args := []string{execPath, "backup", "--json"}
 	if configFile != "" {
 		args = append(args, "--config", configFile)
 	}
@@ -785,10 +787,24 @@ func installLaunchdCron(hour int, out *output.Output) error {
 		return outputError(out, fmt.Errorf("getting executable path: %w", err))
 	}
 
-	args := cronBackupArgs(execPath)
-	var argsXML strings.Builder
-	for _, arg := range args {
-		argsXML.WriteString(fmt.Sprintf("        <string>%s</string>\n", arg))
+	// capture current PATH for scheduled execution (launchd uses minimal environment)
+	currentPath := os.Getenv("PATH")
+	if currentPath == "" {
+		currentPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+	}
+
+	// build shell command with timestamp logging (launchd overwrites logs, so we use shell append)
+	cronCmd := buildCronCommand(cronBackupArgs(execPath))
+	logFile := filepath.Join(home, "Library", "Logs", "dotpak", "backup.log")
+	timestampCmd := "date \"+%Y-%m-%dT%H:%M:%S%z\""
+	shellCmd := fmt.Sprintf("{ echo '---'; %s; %s; } >> %s 2>&1", timestampCmd, cronCmd, shellQuote(logFile))
+	escapedShellCmd, err := xmlEscapeText(shellCmd)
+	if err != nil {
+		return outputError(out, fmt.Errorf("escaping shell command: %w", err))
+	}
+	escapedPath, err := xmlEscapeText(currentPath)
+	if err != nil {
+		return outputError(out, fmt.Errorf("escaping PATH: %w", err))
 	}
 
 	plistContent := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
@@ -799,7 +815,10 @@ func installLaunchdCron(hour int, out *output.Output) error {
     <string>com.user.dotpak</string>
     <key>ProgramArguments</key>
     <array>
-%s    </array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>%s</string>
+    </array>
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
@@ -807,13 +826,14 @@ func installLaunchdCron(hour int, out *output.Output) error {
         <key>Minute</key>
         <integer>0</integer>
     </dict>
-    <key>StandardOutPath</key>
-    <string>%s/Library/Logs/dotpak/backup.log</string>
-    <key>StandardErrorPath</key>
-    <string>%s/Library/Logs/dotpak/backup-error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>%s</string>
+    </dict>
 </dict>
 </plist>
-`, argsXML.String(), hour, home, home)
+`, escapedShellCmd, hour, escapedPath)
 
 	if err = os.MkdirAll(filepath.Join(home, "Library", "Logs", "dotpak"), 0755); err != nil {
 		return outputError(out, fmt.Errorf("creating logs directory: %w", err))
@@ -873,10 +893,20 @@ func installLinuxCron(hour int, out *output.Output) error {
 		return outputError(out, fmt.Errorf("creating logs directory: %w", err))
 	}
 
+	// capture current PATH for scheduled execution (cron uses minimal /usr/bin:/bin)
+	currentPath := os.Getenv("PATH")
+	if currentPath == "" {
+		currentPath = "/usr/local/bin:/usr/bin:/bin"
+	}
+
 	cronCmd := buildCronCommand(cronBackupArgs(execPath))
-	logOut := shellQuote(filepath.Join(logDir, "backup.log"))
-	logErr := shellQuote(filepath.Join(logDir, "backup-error.log"))
-	cronLine := fmt.Sprintf("0 %d * * * %s >> %s 2>> %s %s", hour, cronCmd, logOut, logErr, linuxCronMarker)
+	logFile := shellQuote(filepath.Join(logDir, "backup.log"))
+	// use shell group to add timestamp before each run, combine stdout/stderr
+	cronLine := fmt.Sprintf(
+		"0 %d * * * { echo '---'; date -Iseconds; %s; } >> %s 2>&1 %s",
+		hour, cronCmd, logFile, linuxCronMarker,
+	)
+	pathLine := fmt.Sprintf("PATH=%s %s", currentPath, linuxCronMarker)
 
 	existing, err := readCrontab()
 	if err != nil {
@@ -884,7 +914,7 @@ func installLinuxCron(hour int, out *output.Output) error {
 	}
 
 	lines, _ := filterDotpakCron(existing)
-	lines = append(lines, cronLine)
+	lines = append(lines, pathLine, cronLine)
 
 	if err = writeCrontab(strings.Join(lines, "\n") + "\n"); err != nil {
 		return outputError(out, err)
@@ -929,6 +959,14 @@ func buildCronCommand(args []string) string {
 		quoted = append(quoted, shellQuote(arg))
 	}
 	return strings.Join(quoted, " ")
+}
+
+func xmlEscapeText(value string) (string, error) {
+	var buf bytes.Buffer
+	if err := xml.EscapeText(&buf, []byte(value)); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }
 
 func shellQuote(value string) string {
