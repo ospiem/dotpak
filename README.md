@@ -15,7 +15,7 @@ dotpak diff backup.tar.gz -v     # see what changed
 - 🍺 **Homebrew/apt/Go** — backs up and restores your package lists
 - 📅 **Scheduled backups** — launchd on macOS, cron on Linux
 - 🎯 **Selective restore** — restore by category (shell, editor, cloud, etc.)
-- 🔍 **Diff & verify** — compare archives with current files, check integrity
+- 🔍 **Diff & verify** — compare archives with current files
 
 ## Installation
 
