@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-01-21
+
+### Removed
+
+- Removed outdated references to checksum and verify command from documentation
+
 ## [0.1.0] - 2026-01-20
 
 Initial public release.
@@ -19,7 +25,6 @@ Initial public release.
 - **Profiles**: Named configurations for different environments
 - **Hostname-aware**: Automatic per-machine configuration overrides
 - **Safety backups**: Creates backup of existing files before restore (encrypted if source was)
-- **Integrity verification**: SHA256 checksum verification
 - **Homebrew integration**: Backs up Brewfile and Mac App Store apps list
 - **JSON output**: All commands support `--json` for scripting
 
@@ -29,7 +34,6 @@ Initial public release.
 backup      Create backup archive
 restore     Restore from archive
 list        List available backups
-verify      Verify archive integrity
 diff        Show differences with current files
 contents    List archive contents
 config      Manage configuration (init, validate)
