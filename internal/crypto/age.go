@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 )
@@ -28,28 +29,27 @@ func (e *AgeEncryptor) Available() bool {
 	return HasAge()
 }
 
-// Encrypt encrypts a file using age.
-func (e *AgeEncryptor) Encrypt(inputPath string) (string, error) {
+// EncryptReader encrypts data from r and writes the result to outputPath.
+func (e *AgeEncryptor) EncryptReader(r io.Reader, outputPath string) error {
 	if e.recipientsFile == "" {
-		return "", errors.New("age recipients file not specified")
+		return errors.New("age recipients file not specified")
 	}
 
 	if _, err := os.Stat(e.recipientsFile); err != nil {
-		return "", fmt.Errorf("age recipients file not found: %s", e.recipientsFile)
+		return fmt.Errorf("age recipients file not found: %s", e.recipientsFile)
 	}
 
-	outputPath := inputPath + ".age"
-
-	//nolint:gosec // G204: age command with validated recipients file path
-	cmd := exec.Command("age", "-e", "-R", e.recipientsFile, "-o", outputPath, inputPath)
+	//nolint:gosec // g204: age command with validated recipients file path
+	cmd := exec.Command("age", "-e", "-R", e.recipientsFile, "-o", outputPath)
+	cmd.Stdin = r
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("age encryption failed: %s", stderr.String())
+		return fmt.Errorf("age encryption failed: %s", stderr.String())
 	}
 
-	return outputPath, nil
+	return nil
 }
 
 // Decrypt decrypts a file using age.

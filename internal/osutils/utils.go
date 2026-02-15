@@ -1,5 +1,5 @@
-// Package utils provide shared utility functions for dotpak.
-package utils //nolint:revive // utils is an appropriate name for shared utilities
+// Package osutils provide shared utility functions for dotpak.
+package osutils
 
 import (
 	"fmt"

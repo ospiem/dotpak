@@ -83,23 +83,28 @@ dotpak cron uninstall           # remove
 
 Uses launchd on macOS, cron on Linux.
 
-### macOS App Bundle
+### Full Disk Access (macOS)
 
-On macOS, scheduled backups may require **Full Disk Access** permission if your backup directory is in a protected location. The app bundle provides a way to grant this permission.
+Scheduled backups to protected directories (Desktop, Documents, Downloads, iCloud) require **Full Disk Access** for the dotpak binary. The launchd plist calls dotpak directly (no shell wrapper), so only the dotpak binary itself needs FDA.
 
-**Download** from [Releases](https://github.com/ospiem/dotpak/releases) (file `Dotpak-vX.X.X-darwin-*.app.tar.gz`)
+1. Find binary path:
+   - `go install`: `~/go/bin/dotpak` (or `$GOBIN/dotpak`)
+   - Homebrew: `$(brew --prefix)/bin/dotpak`
+   - Manual: wherever you placed it
 
-**Or build locally:**
+2. Open **System Settings** → **Privacy & Security** → **Full Disk Access**
 
-```bash
-make app-bundle   # creates Dotpak.app
-```
+3. Click **+**, then **Cmd+Shift+G** and enter the full binary path
 
-**Grant Full Disk Access:**
+4. Reinstall cron after adding FDA:
+   ```bash
+   dotpak cron uninstall && dotpak cron install
+   ```
 
-1. Open **System Settings** → **Privacy & Security** → **Full Disk Access**
-2. Click **+** and add `Dotpak.app`
-3. Reinstall cron: `dotpak cron uninstall && dotpak cron install`
+> **Note:** After updating dotpak (brew upgrade, go install, etc.), re-add the binary to
+> Full Disk Access — macOS tracks permissions by code signature, which changes with each build.
+
+Check status: `dotpak cron status`
 
 ## Safety
 

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ospiem/dotpak/internal/utils"
+	"github.com/ospiem/dotpak/internal/osutils"
 )
 
 // Metadata represents backup metadata.
@@ -71,7 +71,7 @@ type BackupInfo struct {
 
 // New creates a new Metadata with current timestamp and hostname.
 func New() *Metadata {
-	hostname, err := utils.Hostname()
+	hostname, err := osutils.Hostname()
 	if err != nil {
 		hostname = "unknown"
 	}

@@ -16,11 +16,12 @@ import (
 
 	"github.com/sergi/go-diff/diffmatchpatch"
 
+	"github.com/ospiem/dotpak/internal/backup"
 	"github.com/ospiem/dotpak/internal/config"
 	"github.com/ospiem/dotpak/internal/crypto"
 	"github.com/ospiem/dotpak/internal/metadata"
+	"github.com/ospiem/dotpak/internal/osutils"
 	"github.com/ospiem/dotpak/internal/output"
-	"github.com/ospiem/dotpak/internal/utils"
 )
 
 // Categories maps category names to path prefixes.
@@ -77,7 +78,7 @@ type Restore struct {
 // New creates a new Restore instance.
 // Returns nil if home directory cannot be determined.
 func New(cfg *config.Config, opts *Options, out *output.Output) *Restore {
-	home, err := utils.HomeDir()
+	home, err := osutils.HomeDir()
 	if err != nil {
 		out.Error("Cannot determine home directory: %v\n", err)
 		return nil
@@ -237,7 +238,7 @@ func (r *Restore) Run(archivePath string) (*metadata.RestoreResult, error) {
 }
 
 func (r *Restore) decryptArchive(archivePath string) (string, error) {
-	tmpFile, err := os.CreateTemp("", "dotpak-decrypt-*.tar.gz")
+	tmpFile, err := osutils.CreateTempFile("dotpak-decrypt-*.tar.gz")
 	if err != nil {
 		return "", err
 	}
@@ -283,34 +284,8 @@ func (r *Restore) createSafetyBackup(sourceArchive, originalArchive string) (str
 	}
 
 	timestamp := time.Now().Format("20060102_150405")
-	archivePath := filepath.Join(preRestoreDir, fmt.Sprintf("pre-restore-%s.tar.gz", timestamp))
 
-	outFile, err := os.OpenFile(archivePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return "", err
-	}
-	defer outFile.Close()
-
-	gzWriter := gzip.NewWriter(outFile)
-	defer gzWriter.Close()
-
-	tarWriter := tar.NewWriter(gzWriter)
-	defer tarWriter.Close()
-
-	for _, relPath := range filesToBackup {
-		fullPath := filepath.Join(r.homeDir, relPath)
-		if addErr := addFileToSafetyBackup(tarWriter, fullPath, relPath); addErr != nil {
-			r.out.Verbose("Failed to backup %s: %v\n", relPath, addErr)
-			continue
-		}
-	}
-
-	// close writers before encryption
-	_ = tarWriter.Close()
-	_ = gzWriter.Close()
-	_ = outFile.Close()
-
-	// encrypt safety backup if original archive was encrypted
+	// encrypt safety backup if original archive was encrypted — stream directly
 	method := crypto.DetectMethod(originalArchive)
 	if method != crypto.MethodNone {
 		enc, encErr := crypto.NewEncryptor(method, crypto.Options{
@@ -319,18 +294,76 @@ func (r *Restore) createSafetyBackup(sourceArchive, originalArchive string) (str
 		})
 		if encErr != nil {
 			r.out.Warning("Failed to create encryptor for safety backup: %v\n", encErr)
-			return archivePath, nil // fallback to unencrypted
+			// fall through to unencrypted path below
+		} else {
+			encryptedPath := filepath.Join(preRestoreDir,
+				fmt.Sprintf("pre-restore-%s.tar.gz.%s", timestamp, string(method)))
+
+			pr, pw := io.Pipe()
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- r.writeSafetyArchive(pw, filesToBackup)
+				_ = pw.Close()
+			}()
+
+			if encErr = enc.EncryptReader(pr, encryptedPath); encErr != nil {
+				_ = pr.Close() // unblock the writer goroutine
+				if writeErr := <-errCh; writeErr != nil {
+					r.out.Verbose("Safety archive write also failed: %v\n", writeErr)
+				}
+				_ = os.Remove(encryptedPath)
+				r.out.Warning("Failed to encrypt safety backup: %v\n", encErr)
+				// fall through to unencrypted path below
+			} else if writeErr := <-errCh; writeErr != nil {
+				_ = os.Remove(encryptedPath)
+				return "", writeErr
+			} else {
+				return encryptedPath, nil
+			}
 		}
-		encryptedPath, encErr := enc.Encrypt(archivePath)
-		if encErr != nil {
-			r.out.Warning("Failed to encrypt safety backup: %v\n", encErr)
-			return archivePath, nil // fallback to unencrypted
-		}
-		_ = os.Remove(archivePath)
-		return encryptedPath, nil
+	}
+
+	// unencrypted path
+	archivePath := filepath.Join(preRestoreDir, fmt.Sprintf("pre-restore-%s.tar.gz", timestamp))
+
+	outFile, err := os.OpenFile(archivePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return "", err
+	}
+	defer outFile.Close()
+
+	if err = r.writeSafetyArchive(outFile, filesToBackup); err != nil {
+		return "", err
 	}
 
 	return archivePath, nil
+}
+
+// writeSafetyArchive writes a tar.gz stream of the given files to w.
+func (r *Restore) writeSafetyArchive(w io.Writer, filesToBackup []string) (err error) {
+	gzWriter := gzip.NewWriter(w)
+	defer func() {
+		if cerr := gzWriter.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+
+	tarWriter := tar.NewWriter(gzWriter)
+	defer func() {
+		if cerr := tarWriter.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+
+	for _, relPath := range filesToBackup {
+		fullPath := filepath.Join(r.homeDir, relPath)
+		if addErr := backup.AddFileToTar(tarWriter, fullPath, relPath); addErr != nil {
+			r.out.Verbose("Failed to backup %s: %v\n", relPath, addErr)
+			continue
+		}
+	}
+
+	return nil
 }
 
 func (r *Restore) findFilesToBackup(sourceArchive string) ([]string, error) {
@@ -366,7 +399,7 @@ func (r *Restore) findFilesToBackup(sourceArchive string) ([]string, error) {
 			continue
 		}
 
-		//nolint:gosec // G305: path validated by isSafePath() above
+		//nolint:gosec // g305: path validated by isSafePath() above
 		targetPath := filepath.Join(r.homeDir, header.Name)
 		if _, statErr := os.Stat(targetPath); statErr == nil {
 			filesToBackup = append(filesToBackup, header.Name)
@@ -374,52 +407,6 @@ func (r *Restore) findFilesToBackup(sourceArchive string) ([]string, error) {
 	}
 
 	return filesToBackup, nil
-}
-
-func addFileToSafetyBackup(tw *tar.Writer, fullPath, relPath string) error {
-	// use Lstat to detect symlinks without following them
-	info, err := os.Lstat(fullPath)
-	if err != nil {
-		return err
-	}
-
-	// handle symlinks
-	if info.Mode()&os.ModeSymlink != 0 {
-		linkTarget, readErr := os.Readlink(fullPath)
-		if readErr != nil {
-			return readErr
-		}
-		header, headerErr := tar.FileInfoHeader(info, linkTarget)
-		if headerErr != nil {
-			return headerErr
-		}
-		header.Name = filepath.ToSlash(relPath)
-		return tw.WriteHeader(header)
-	}
-
-	// regular file handling
-	file, err := os.Open(fullPath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	header, err := tar.FileInfoHeader(info, "")
-	if err != nil {
-		return err
-	}
-
-	header.Name = filepath.ToSlash(relPath)
-
-	if err = tw.WriteHeader(header); err != nil {
-		return err
-	}
-
-	if _, err = io.Copy(tw, file); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func (r *Restore) extractArchive(tarPath string) (int, error) {
@@ -457,7 +444,7 @@ func (r *Restore) extractArchive(tarPath string) (int, error) {
 			continue
 		}
 
-		//nolint:gosec // G305: path validated by isSafePath() above and isPathWithinBase() below
+		//nolint:gosec // g305: path validated by isSafePath() above and isPathWithinBase() below
 		targetPath := filepath.Join(r.homeDir, header.Name)
 
 		// defense-in-depth: verify resolved path is within home directory
@@ -472,10 +459,10 @@ func (r *Restore) extractArchive(tarPath string) (int, error) {
 			continue
 		}
 
-		if totalExtracted+header.Size > utils.MaxExtractTotalSize {
+		if totalExtracted+header.Size > osutils.MaxExtractTotalSize {
 			return count, fmt.Errorf(
 				"total extracted size exceeds limit of %s",
-				utils.FormatSize(utils.MaxExtractTotalSize),
+				osutils.FormatSize(osutils.MaxExtractTotalSize),
 			)
 		}
 
@@ -486,18 +473,18 @@ func (r *Restore) extractArchive(tarPath string) (int, error) {
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			//nolint:gosec // G115: mode is masked to valid 9-bit permission range before conversion
+			//nolint:gosec // g115: mode is masked to valid 9-bit permission range before conversion
 			if mkdirErr := os.MkdirAll(targetPath, os.FileMode(header.Mode)&0o777); mkdirErr != nil {
 				r.out.Warning("Failed to create directory %s: %v\n", header.Name, mkdirErr)
 			}
 
 		case tar.TypeReg:
-			//nolint:gosec // G115: mode is masked to valid 9-bit permission range before conversion
+			//nolint:gosec // g115: mode is masked to valid 9-bit permission range before conversion
 			if extractErr := extractFile(
 				tarReader,
 				targetPath,
 				os.FileMode(header.Mode)&0o777,
-				utils.MaxExtractFileSize,
+				osutils.MaxExtractFileSize,
 			); extractErr != nil {
 				r.out.Warning("Failed to extract %s: %v\n", header.Name, extractErr)
 				continue
@@ -511,7 +498,7 @@ func (r *Restore) extractArchive(tarPath string) (int, error) {
 				continue
 			}
 			// defense-in-depth: verify resolved symlink target is within home
-			//nolint:gosec // G305: path validated by isPathWithinBase() immediately below
+			//nolint:gosec // g305: path validated by isPathWithinBase() immediately below
 			resolvedTarget := filepath.Join(filepath.Dir(targetPath), header.Linkname)
 			if !isPathWithinBase(resolvedTarget, r.homeDir) {
 				r.out.Warning("Skipping symlink that escapes home: %s -> %s\n", header.Name, header.Linkname)
@@ -621,7 +608,7 @@ func ListArchiveContents(cfg *config.Config, archivePath string, out *output.Out
 	identityFiles := resolveAgeIdentityFiles(cfg)
 
 	if strings.HasSuffix(archivePath, ".age") || strings.HasSuffix(archivePath, ".gpg") {
-		tmpFile, err := os.CreateTemp("", "dotpak-list-*.tar.gz")
+		tmpFile, err := osutils.CreateTempFile("dotpak-list-*.tar.gz")
 		if err != nil {
 			return err
 		}
@@ -684,7 +671,7 @@ type fileContent struct {
 
 // ShowDiff shows differences between archive and current files.
 func ShowDiff(cfg *config.Config, archivePath string, verbose bool, out *output.Output) error {
-	home, err := utils.HomeDir()
+	home, err := osutils.HomeDir()
 	if err != nil {
 		return err
 	}
@@ -692,7 +679,7 @@ func ShowDiff(cfg *config.Config, archivePath string, verbose bool, out *output.
 	identityFiles := resolveAgeIdentityFiles(cfg)
 
 	if strings.HasSuffix(archivePath, ".age") || strings.HasSuffix(archivePath, ".gpg") {
-		tmpFile, tmpErr := os.CreateTemp("", "dotpak-diff-*.tar.gz")
+		tmpFile, tmpErr := osutils.CreateTempFile("dotpak-diff-*.tar.gz")
 		if tmpErr != nil {
 			return tmpErr
 		}
@@ -745,7 +732,7 @@ func ShowDiff(cfg *config.Config, archivePath string, verbose bool, out *output.
 			continue
 		}
 
-		//nolint:gosec // G305: path used only for stat comparison, no extraction
+		//nolint:gosec // g305: path used only for stat comparison, no extraction
 		currentPath := filepath.Join(home, header.Name)
 
 		currentInfo, statErr := os.Stat(currentPath)
@@ -878,5 +865,5 @@ func showFileDiff(home string, fc fileContent, out *output.Output) {
 }
 
 func formatSize(size int64) string {
-	return utils.FormatSize(size)
+	return osutils.FormatSize(size)
 }

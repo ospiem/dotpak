@@ -14,8 +14,8 @@ import (
 	"github.com/ospiem/dotpak/internal/config"
 	"github.com/ospiem/dotpak/internal/crypto"
 	"github.com/ospiem/dotpak/internal/metadata"
+	"github.com/ospiem/dotpak/internal/osutils"
 	"github.com/ospiem/dotpak/internal/output"
-	"github.com/ospiem/dotpak/internal/utils"
 )
 
 // Options holds backup options.
@@ -40,7 +40,7 @@ type Backup struct {
 // New creates a new Backup instance.
 // Returns nil if the home directory cannot be determined.
 func New(cfg *config.Config, opts *Options, out *output.Output) *Backup {
-	home, err := utils.HomeDir()
+	home, err := osutils.HomeDir()
 	if err != nil {
 		out.Error("Cannot determine home directory: %v\n", err)
 		return nil
@@ -65,7 +65,20 @@ func (b *Backup) Run() (*metadata.BackupResult, error) {
 	}
 
 	if err := os.MkdirAll(b.cfg.Backup.BackupDir, 0700); err != nil {
-		result.Error = fmt.Sprintf("creating backup directory: %v", err)
+		errMsg := fmt.Sprintf("creating backup directory: %v", err)
+		if os.IsPermission(err) && runtime.GOOS == "darwin" {
+			execPath, _ := os.Executable()
+			resolvedPath, _ := filepath.EvalSymlinks(execPath)
+			if resolvedPath == "" {
+				resolvedPath = execPath
+			}
+			errMsg += fmt.Sprintf(
+				"\n\nFull Disk Access may be required. "+
+					"Add to System Settings → Privacy & Security → Full Disk Access:\n  %s",
+				resolvedPath,
+			)
+		}
+		result.Error = errMsg
 		return result, nil
 	}
 
@@ -120,41 +133,46 @@ func (b *Backup) Run() (*metadata.BackupResult, error) {
 	timestamp := time.Now().Format("20060102_150405")
 	archivePath := filepath.Join(b.cfg.Backup.BackupDir, fmt.Sprintf("dotfiles-%s.tar.gz", timestamp))
 
-	b.out.Print("Creating archive: %s\n", filepath.Base(archivePath))
-	if err = b.createArchive(archivePath, files); err != nil {
-		result.Error = fmt.Sprintf("creating archive: %v", err)
-		return result, nil
-	}
-
-	finalArchive := archivePath
+	var finalArchive string
 	if encMethod != "" {
-		b.out.Print("Encrypting with %s...\n", encMethod)
+		b.out.Print("Creating encrypted archive with %s...\n", encMethod)
 
 		enc, encErr := crypto.NewEncryptor(crypto.Method(encMethod), crypto.Options{
 			AgeRecipientsFile: recipientsFile,
 			GPGRecipient:      gpgRecipient,
 		})
 		if encErr != nil {
-			if rmErr := os.Remove(archivePath); rmErr != nil {
-				b.out.Warning("Failed to remove archive: %v\n", rmErr)
-			}
 			result.Error = fmt.Sprintf("encryption failed: %v", encErr)
 			return result, nil
 		}
 
-		encryptedPath, encErr := enc.Encrypt(archivePath)
-		if encErr != nil {
-			if rmErr := os.Remove(archivePath); rmErr != nil {
-				b.out.Warning("Failed to remove archive: %v\n", rmErr)
-			}
-			result.Error = fmt.Sprintf("encryption failed: %v", encErr)
+		encryptedPath := archivePath + "." + encMethod
+		if encErr = b.createEncryptedArchive(encryptedPath, files, enc); encErr != nil {
+			_ = os.Remove(encryptedPath)
+			result.Error = fmt.Sprintf("creating encrypted archive: %v", encErr)
 			return result, nil
-		}
-
-		if rmErr := os.Remove(archivePath); rmErr != nil {
-			b.out.Warning("Failed to remove unencrypted archive: %v\n", rmErr)
 		}
 		finalArchive = encryptedPath
+	} else {
+		b.out.Print("Creating archive: %s\n", filepath.Base(archivePath))
+		if err = b.createArchive(archivePath, files); err != nil {
+			errMsg := fmt.Sprintf("creating archive: %v", err)
+			if os.IsPermission(err) && runtime.GOOS == "darwin" {
+				execPath, _ := os.Executable()
+				resolvedPath, _ := filepath.EvalSymlinks(execPath)
+				if resolvedPath == "" {
+					resolvedPath = execPath
+				}
+				errMsg += fmt.Sprintf(
+					"\n\nFull Disk Access may be required. "+
+						"Add to System Settings → Privacy & Security → Full Disk Access:\n  %s",
+					resolvedPath,
+				)
+			}
+			result.Error = errMsg
+			return result, nil
+		}
+		finalArchive = archivePath
 	}
 
 	meta := metadata.New()
@@ -305,21 +323,46 @@ func (b *Backup) collectItem(relPath string) ([]FileInfo, error) {
 		}}, nil
 	}
 
-	// directory - always recurse
+	// directory - always recurse, but don't follow symlinked directories
 	var files []FileInfo
-	err = filepath.Walk(fullPath, func(path string, info os.FileInfo, err error) error {
+	err = filepath.WalkDir(fullPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			b.out.Verbose("Cannot access %s: %v\n", path, err)
 			b.stats.FilesSkipped++
 			return nil
 		}
-		rel, err := filepath.Rel(b.homeDir, path)
-		if err != nil {
-			b.out.Verbose("Cannot compute relative path for %s: %v\n", path, err)
+		rel, relErr := filepath.Rel(b.homeDir, path)
+		if relErr != nil {
+			b.out.Verbose("Cannot compute relative path for %s: %v\n", path, relErr)
 			b.stats.FilesSkipped++
 			return nil
 		}
-		if info.IsDir() {
+
+		// symlink: add the symlink entry itself without following it.
+		// WalkDir never descends into symlinks, so no SkipDir needed.
+		// returning SkipDir for a non-directory entry would skip remaining
+		// siblings in the parent directory, which we must avoid.
+		if d.Type()&os.ModeSymlink != 0 {
+			if b.isExcluded(rel) {
+				b.stats.FilesExcluded++
+				return nil
+			}
+			fi, infoErr := d.Info()
+			if infoErr != nil {
+				b.out.Verbose("Cannot stat %s: %v\n", path, infoErr)
+				b.stats.FilesSkipped++
+				return nil
+			}
+			files = append(files, FileInfo{
+				FullPath: path,
+				RelPath:  rel,
+				Size:     fi.Size(),
+				ModTime:  fi.ModTime(),
+			})
+			return nil
+		}
+
+		if d.IsDir() {
 			if b.isExcluded(rel) {
 				b.stats.FilesExcluded++
 				return filepath.SkipDir
@@ -331,11 +374,18 @@ func (b *Backup) collectItem(relPath string) ([]FileInfo, error) {
 			return nil
 		}
 
+		fi, infoErr := d.Info()
+		if infoErr != nil {
+			b.out.Verbose("Cannot stat %s: %v\n", path, infoErr)
+			b.stats.FilesSkipped++
+			return nil
+		}
+
 		files = append(files, FileInfo{
 			FullPath: path,
 			RelPath:  rel,
-			Size:     info.Size(),
-			ModTime:  info.ModTime(),
+			Size:     fi.Size(),
+			ModTime:  fi.ModTime(),
 		})
 		return nil
 	})
@@ -558,5 +608,5 @@ type FileInfo struct {
 }
 
 func formatSize(size int64) string {
-	return utils.FormatSize(size)
+	return osutils.FormatSize(size)
 }

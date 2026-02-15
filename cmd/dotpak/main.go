@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -12,15 +13,16 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ospiem/dotpak/internal/backup"
 	"github.com/ospiem/dotpak/internal/config"
 	"github.com/ospiem/dotpak/internal/metadata"
+	"github.com/ospiem/dotpak/internal/osutils"
 	"github.com/ospiem/dotpak/internal/output"
 	"github.com/ospiem/dotpak/internal/restore"
-	"github.com/ospiem/dotpak/internal/utils"
 )
 
 // Build information. Populated at build time via -ldflags.
@@ -501,7 +503,24 @@ func cronCmd() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(installCmd, uninstallCmd)
+	statusCmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show scheduled backup status",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return cronStatus(getOutput())
+		},
+	}
+
+	runCmd := &cobra.Command{
+		Use:    "run",
+		Short:  "Run backup with logging (used by launchd/cron)",
+		Hidden: true,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return cronRun()
+		},
+	}
+
+	cmd.AddCommand(installCmd, uninstallCmd, statusCmd, runCmd)
 	return cmd
 }
 
@@ -558,7 +577,7 @@ func validateConfig(cfg *config.Config) error {
 	} else {
 		expanded := backupDir
 		if strings.HasPrefix(expanded, "~/") {
-			if home, err := utils.HomeDir(); err == nil {
+			if home, err := osutils.HomeDir(); err == nil {
 				expanded = filepath.Join(home, expanded[2:])
 			}
 		}
@@ -591,7 +610,7 @@ func validateConfig(cfg *config.Config) error {
 		} else {
 			recipientsPath := cfg.Backup.AgeRecipients
 			if strings.HasPrefix(recipientsPath, "~/") {
-				if home, err := utils.HomeDir(); err == nil {
+				if home, err := osutils.HomeDir(); err == nil {
 					recipientsPath = filepath.Join(home, recipientsPath[2:])
 				}
 			}
@@ -659,7 +678,7 @@ func handleHomebrew(backupDir string, dryRun bool, out *output.Output) error {
 		return nil
 	}
 
-	//nolint:gosec // G204: absBrewfile is validated to be within backup directory above
+	//nolint:gosec // g204: absBrewfile is validated to be within backup directory above
 	cmd := exec.Command("brew", "bundle", "install", "--file="+absBrewfile, "--no-lock")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -725,7 +744,7 @@ func handleGo(backupDir string, dryRun bool, out *output.Output) error {
 	var installed, failed int
 	for _, pkg := range packages {
 		out.Verbose("Installing %s...\n", pkg)
-		//nolint:gosec // G204: pkg comes from go-packages.txt backup file created by this tool
+		//nolint:gosec // g204: pkg comes from go-packages.txt backup file created by this tool
 		cmd := exec.Command("go", "install", pkg+"@latest")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -767,6 +786,74 @@ func uninstallCron(out *output.Output) error {
 	}
 }
 
+func cronStatus(out *output.Output) error {
+	switch runtime.GOOS {
+	case darwin:
+		return launchdStatus(out)
+	case linux:
+		return linuxCronStatus(out)
+	default:
+		return outputError(out, errors.New("cron status is supported on macOS and Linux only"))
+	}
+}
+
+func cronLogPath() (string, error) {
+	home, err := osutils.HomeDir()
+	if err != nil {
+		return "", err
+	}
+	if runtime.GOOS == darwin {
+		return filepath.Join(home, "Library", "Logs", "dotpak", "backup.log"), nil
+	}
+	return filepath.Join(home, ".local", "share", "dotpak", "backup.log"), nil
+}
+
+func cronRun() error {
+	logPath, err := cronLogPath()
+	if err != nil {
+		return err
+	}
+
+	if err = os.MkdirAll(filepath.Dir(logPath), 0700); err != nil {
+		return fmt.Errorf("creating log directory: %w", err)
+	}
+
+	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("opening log file: %w", err)
+	}
+	defer logFile.Close()
+
+	fmt.Fprintf(logFile, "---\n%s\n", time.Now().Format(time.RFC3339))
+
+	cfg, err := loadConfig("")
+	if err != nil {
+		fmt.Fprintf(logFile, "error: %v\n", err)
+		return err
+	}
+
+	out := output.New(output.ModeQuiet, false)
+
+	b := backup.New(cfg, &backup.Options{IncludeSecrets: true}, out)
+	result, err := b.Run()
+	if err != nil {
+		fmt.Fprintf(logFile, "error: %v\n", err)
+		return err
+	}
+
+	enc := json.NewEncoder(logFile)
+	enc.SetIndent("", "  ")
+	if encErr := enc.Encode(result); encErr != nil {
+		fmt.Fprintf(logFile, "error encoding result: %v\n", encErr)
+	}
+
+	if !result.Success {
+		return errors.New(result.Error)
+	}
+
+	return nil
+}
+
 func cronBackupArgs(execPath string) []string {
 	args := []string{execPath, "backup", "--json"}
 	if configFile != "" {
@@ -776,15 +863,21 @@ func cronBackupArgs(execPath string) []string {
 }
 
 func installLaunchdCron(hour int, out *output.Output) error {
-	home, err := utils.HomeDir()
+	home, err := osutils.HomeDir()
 	if err != nil {
 		return outputError(out, err)
 	}
-	plistPath := filepath.Join(home, "Library", "LaunchAgents", "com.user.dotpak.plist")
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", "dev.ospiem.dotpak.plist")
 
 	execPath, err := os.Executable()
 	if err != nil {
 		return outputError(out, fmt.Errorf("getting executable path: %w", err))
+	}
+
+	// resolve symlinks - FDA needs the real binary path
+	resolvedPath, err := filepath.EvalSymlinks(execPath)
+	if err != nil {
+		resolvedPath = execPath // fallback to original
 	}
 
 	// capture current PATH for scheduled execution (launchd uses minimal environment)
@@ -793,18 +886,29 @@ func installLaunchdCron(hour int, out *output.Output) error {
 		currentPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 	}
 
-	// build shell command with timestamp logging (launchd overwrites logs, so we use shell append)
-	cronCmd := buildCronCommand(cronBackupArgs(execPath))
-	logFile := filepath.Join(home, "Library", "Logs", "dotpak", "backup.log")
-	timestampCmd := "date \"+%Y-%m-%dT%H:%M:%S%z\""
-	shellCmd := fmt.Sprintf("{ echo '---'; %s; %s; } >> %s 2>&1", timestampCmd, cronCmd, shellQuote(logFile))
-	escapedShellCmd, err := xmlEscapeText(shellCmd)
-	if err != nil {
-		return outputError(out, fmt.Errorf("escaping shell command: %w", err))
+	// build ProgramArguments: dotpak cron run [--config path]
+	programArgs := []string{resolvedPath, "cron", "run"}
+	if configFile != "" {
+		programArgs = []string{resolvedPath, "--config", configFile, "cron", "run"}
 	}
+
+	var argsXML strings.Builder
+	for _, arg := range programArgs {
+		escaped, escErr := xmlEscapeText(arg)
+		if escErr != nil {
+			return outputError(out, fmt.Errorf("escaping argument: %w", escErr))
+		}
+		fmt.Fprintf(&argsXML, "\n        <string>%s</string>", escaped)
+	}
+
 	escapedPath, err := xmlEscapeText(currentPath)
 	if err != nil {
 		return outputError(out, fmt.Errorf("escaping PATH: %w", err))
+	}
+
+	escapedHome, err := xmlEscapeText(home)
+	if err != nil {
+		return outputError(out, fmt.Errorf("escaping HOME: %w", err))
 	}
 
 	plistContent := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
@@ -812,12 +916,9 @@ func installLaunchdCron(hour int, out *output.Output) error {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.user.dotpak</string>
+    <string>dev.ospiem.dotpak</string>
     <key>ProgramArguments</key>
-    <array>
-        <string>/bin/sh</string>
-        <string>-c</string>
-        <string>%s</string>
+    <array>%s
     </array>
     <key>StartCalendarInterval</key>
     <dict>
@@ -828,16 +929,15 @@ func installLaunchdCron(hour int, out *output.Output) error {
     </dict>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>HOME</key>
+        <string>%s</string>
         <key>PATH</key>
         <string>%s</string>
     </dict>
 </dict>
 </plist>
-`, escapedShellCmd, hour, escapedPath)
+`, argsXML.String(), hour, escapedHome, escapedPath)
 
-	if err = os.MkdirAll(filepath.Join(home, "Library", "Logs", "dotpak"), 0755); err != nil {
-		return outputError(out, fmt.Errorf("creating logs directory: %w", err))
-	}
 	if err = os.MkdirAll(filepath.Join(home, "Library", "LaunchAgents"), 0755); err != nil {
 		return outputError(out, fmt.Errorf("creating LaunchAgents directory: %w", err))
 	}
@@ -852,15 +952,19 @@ func installLaunchdCron(hour int, out *output.Output) error {
 
 	out.Success("Installed daily backup at %d:00\n", hour)
 	out.Print("Plist: %s\n", plistPath)
+	out.Print("Binary: %s\n", resolvedPath)
+	out.Print("\nFor protected directories (Desktop, Documents, Downloads, iCloud):\n")
+	out.Print("  Add to System Settings → Privacy & Security → Full Disk Access:\n")
+	out.Print("  %s\n", resolvedPath)
 	return nil
 }
 
 func uninstallLaunchdCron(out *output.Output) error {
-	home, err := utils.HomeDir()
+	home, err := osutils.HomeDir()
 	if err != nil {
 		return outputError(out, err)
 	}
-	plistPath := filepath.Join(home, "Library", "LaunchAgents", "com.user.dotpak.plist")
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", "dev.ospiem.dotpak.plist")
 	_ = exec.Command("launchctl", "unload", plistPath).Run()
 
 	if err = os.Remove(plistPath); err != nil {
@@ -875,10 +979,103 @@ func uninstallLaunchdCron(out *output.Output) error {
 	return nil
 }
 
+func launchdStatus(out *output.Output) error {
+	home, err := osutils.HomeDir()
+	if err != nil {
+		return outputError(out, err)
+	}
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", "dev.ospiem.dotpak.plist")
+
+	// check if plist exists
+	if _, err = os.Stat(plistPath); err != nil {
+		if os.IsNotExist(err) {
+			out.Print("Status: not installed\n")
+			out.Print("\nRun 'dotpak cron install' to set up scheduled backups\n")
+			return nil
+		}
+		return outputError(out, fmt.Errorf("checking plist: %w", err))
+	}
+
+	out.Print("Status: installed\n")
+	out.Print("Plist: %s\n", plistPath)
+
+	// check launchctl status
+	cmdOut, err := exec.Command("launchctl", "list", "dev.ospiem.dotpak").CombinedOutput()
+	if err != nil {
+		out.Print("Launchd: not loaded (run 'launchctl load %s')\n", plistPath)
+	} else {
+		if strings.Contains(string(cmdOut), "PID") {
+			out.Print("Launchd: loaded\n")
+		} else {
+			out.Print("Launchd: loaded (idle)\n")
+		}
+	}
+
+	// load config to check FDA status
+	cfg, err := loadConfig("")
+	if err != nil {
+		out.Print("FDA: unknown (cannot load config)\n")
+		//nolint:nilerr // intentional: status display continues even if config fails
+		return nil
+	}
+
+	fdaStatus := checkFDAStatus(cfg.Backup.BackupDir, home)
+	out.Print("FDA: %s\n", fdaStatus)
+
+	return nil
+}
+
+func checkFDAStatus(backupDir, home string) string {
+	// expand backup dir
+	expandedBackupDir := backupDir
+	if strings.HasPrefix(expandedBackupDir, "~/") {
+		expandedBackupDir = filepath.Join(home, expandedBackupDir[2:])
+	}
+
+	// check if backup_dir is in protected location
+	protectedPrefixes := []string{
+		filepath.Join(home, "Desktop"),
+		filepath.Join(home, "Documents"),
+		filepath.Join(home, "Downloads"),
+		filepath.Join(home, "Library", "Mobile Documents"),
+	}
+
+	isProtected := false
+	for _, prefix := range protectedPrefixes {
+		if strings.HasPrefix(expandedBackupDir, prefix) {
+			isProtected = true
+			break
+		}
+	}
+
+	if !isProtected {
+		return "not required (backup_dir not in protected location)"
+	}
+
+	// try read-only access to the protected directory (or its parent)
+	dir, err := os.Open(expandedBackupDir)
+	if err != nil {
+		if os.IsPermission(err) {
+			return "NOT GRANTED - add dotpak binary to Full Disk Access"
+		}
+		// directory may not exist yet — try the parent
+		parentDir := filepath.Dir(expandedBackupDir)
+		dir, err = os.Open(parentDir)
+		if err != nil {
+			if os.IsPermission(err) {
+				return "NOT GRANTED - add dotpak binary to Full Disk Access"
+			}
+			return fmt.Sprintf("unknown (%v)", err)
+		}
+	}
+	_ = dir.Close()
+	return "granted"
+}
+
 const linuxCronMarker = "# dotpak"
 
 func installLinuxCron(hour int, out *output.Output) error {
-	home, err := utils.HomeDir()
+	home, err := osutils.HomeDir()
 	if err != nil {
 		return outputError(out, err)
 	}
@@ -953,6 +1150,35 @@ func uninstallLinuxCron(out *output.Output) error {
 	return nil
 }
 
+func linuxCronStatus(out *output.Output) error {
+	existing, err := readCrontab()
+	if err != nil {
+		return outputError(out, err)
+	}
+
+	// look for dotpak entry
+	found := false
+	var cronLine string
+	for line := range strings.SplitSeq(existing, "\n") {
+		if strings.HasSuffix(strings.TrimSpace(line), linuxCronMarker) {
+			if !strings.HasPrefix(line, "PATH=") {
+				found = true
+				cronLine = line
+			}
+		}
+	}
+
+	if !found {
+		out.Print("Status: not installed\n")
+		out.Print("\nRun 'dotpak cron install' to set up scheduled backups\n")
+		return nil
+	}
+
+	out.Print("Status: installed\n")
+	out.Print("Cron entry: %s\n", cronLine)
+	return nil
+}
+
 func buildCronCommand(args []string) string {
 	quoted := make([]string, 0, len(args))
 	for _, arg := range args {
@@ -1006,7 +1232,7 @@ func writeCrontab(content string) error {
 	}
 
 	// crontab <file> is atomic - if it fails, the original crontab is preserved
-	//nolint:gosec // G204: tmp.Name() is a temp file created by this function
+	//nolint:gosec // g204: tmp.Name() is a temp file created by this function
 	if err = exec.Command("crontab", tmp.Name()).Run(); err != nil {
 		return fmt.Errorf("installing crontab: %w", err)
 	}
@@ -1086,9 +1312,9 @@ func extractTimestamp(name string) string {
 		ts[9:11], ts[11:13], ts[13:15]) // hour, Minute, Second
 }
 
-// formatSize wraps utils.FormatSize for local use.
+// formatSize wraps osutils.FormatSize for local use.
 func formatSize(size int64) string {
-	return utils.FormatSize(size)
+	return osutils.FormatSize(size)
 }
 
 func getSampleConfig() string {

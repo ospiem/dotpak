@@ -3,6 +3,7 @@ package crypto
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -106,7 +107,7 @@ func TestAgeEncryptor_Available(t *testing.T) {
 	_ = enc.Available()
 }
 
-func TestAgeEncryptor_EncryptWithoutRecipients(t *testing.T) {
+func TestAgeEncryptor_EncryptReaderWithoutRecipients(t *testing.T) {
 	t.Parallel()
 
 	enc, err := NewAgeEncryptor(Options{})
@@ -114,13 +115,13 @@ func TestAgeEncryptor_EncryptWithoutRecipients(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	_, err = enc.Encrypt("/tmp/test.tar.gz")
+	err = enc.EncryptReader(strings.NewReader("test"), "/tmp/test.tar.gz.age")
 	if err == nil {
 		t.Error("expected error when recipients file not specified")
 	}
 }
 
-func TestAgeEncryptor_EncryptWithNonexistentRecipients(t *testing.T) {
+func TestAgeEncryptor_EncryptReaderWithNonexistentRecipients(t *testing.T) {
 	t.Parallel()
 
 	enc, err := NewAgeEncryptor(Options{
@@ -130,7 +131,7 @@ func TestAgeEncryptor_EncryptWithNonexistentRecipients(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	_, err = enc.Encrypt("/tmp/test.tar.gz")
+	err = enc.EncryptReader(strings.NewReader("test"), "/tmp/test.tar.gz.age")
 	if err == nil {
 		t.Error("expected error when recipients file not found")
 	}
