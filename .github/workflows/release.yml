@@ -54,7 +54,7 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-        run: make build OUTPUT=dotpak
+        run: make build OUTPUT=dotpak VERSION=${GITHUB_REF#refs/tags/}
 
       - name: Create archive
         run: |
