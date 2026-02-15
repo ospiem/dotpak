@@ -56,13 +56,6 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: make build OUTPUT=dotpak
 
-      - name: Create app bundle (macOS only)
-        if: matrix.goos == 'darwin'
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: make app-bundle
-
       - name: Create archive
         run: |
           VERSION=${GITHUB_REF#refs/tags/}
@@ -70,26 +63,11 @@ jobs:
           tar -czvf "$ARCHIVE" dotpak
           echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
 
-      - name: Create app bundle archive (macOS only)
-        if: matrix.goos == 'darwin'
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          APP_ARCHIVE="Dotpak-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}.app.tar.gz"
-          tar -czvf "$APP_ARCHIVE" Dotpak.app
-          echo "APP_ARCHIVE=$APP_ARCHIVE" >> $GITHUB_ENV
-
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: dotpak-${{ matrix.goos }}-${{ matrix.goarch }}
           path: ${{ env.ARCHIVE }}
-
-      - name: Upload app bundle artifact
-        if: matrix.goos == 'darwin'
-        uses: actions/upload-artifact@v4
-        with:
-          name: dotpak-${{ matrix.goos }}-${{ matrix.goarch }}-app
-          path: ${{ env.APP_ARCHIVE }}
 
   release:
     name: Release

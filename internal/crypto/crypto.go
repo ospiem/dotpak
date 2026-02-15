@@ -3,6 +3,7 @@ package crypto
 
 import (
 	"errors"
+	"io"
 	"os/exec"
 	"strings"
 )
@@ -21,8 +22,8 @@ const (
 
 // Encryptor defines the interface for encryption/decryption operations.
 type Encryptor interface {
-	// Encrypt encrypts inputPath and returns the encrypted file path.
-	Encrypt(inputPath string) (outputPath string, err error)
+	// EncryptReader encrypts data from r and writes the result to outputPath.
+	EncryptReader(r io.Reader, outputPath string) error
 	// Decrypt decrypts inputPath to outputPath.
 	Decrypt(inputPath, outputPath string) error
 	// Available returns true if the encryption tool is available.

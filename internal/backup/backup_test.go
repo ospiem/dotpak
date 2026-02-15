@@ -3,6 +3,7 @@ package backup
 import (
 	"archive/tar"
 	"compress/gzip"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -768,6 +769,146 @@ func TestHasGPG(t *testing.T) {
 	t.Parallel()
 	_ = HasGPG()
 }
+
+func TestCollectItem_Symlinks(t *testing.T) {
+	t.Parallel()
+
+	setup := setupTest(t)
+
+	// create a real file to symlink to
+	createTestFile(t, filepath.Join(setup.homeDir, "realfile.txt"), "content")
+
+	// create a symlink to a file
+	if err := os.Symlink(
+		filepath.Join(setup.homeDir, "realfile.txt"),
+		filepath.Join(setup.homeDir, ".link-to-file"),
+	); err != nil {
+		t.Fatalf("failed to create file symlink: %v", err)
+	}
+
+	// create a real directory with a file inside
+	createTestFile(t, filepath.Join(setup.homeDir, "realdir", "inner.txt"), "inner")
+
+	// create a symlink to a directory
+	if err := os.Symlink(
+		filepath.Join(setup.homeDir, "realdir"),
+		filepath.Join(setup.homeDir, ".link-to-dir"),
+	); err != nil {
+		t.Fatalf("failed to create dir symlink: %v", err)
+	}
+
+	cfg := &config.Config{
+		Excludes: config.ExcludesConfig{},
+	}
+	b := &Backup{
+		cfg:     cfg,
+		homeDir: setup.homeDir,
+		out:     output.New(output.ModeQuiet, false),
+	}
+
+	t.Run("collects symlink to file", func(t *testing.T) {
+		files, err := b.collectItem(".link-to-file")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(files) != 1 {
+			t.Fatalf("expected 1 file, got %d", len(files))
+		}
+		if files[0].RelPath != ".link-to-file" {
+			t.Errorf("expected .link-to-file, got %s", files[0].RelPath)
+		}
+	})
+
+	t.Run("collects symlink to directory as single entry", func(t *testing.T) {
+		files, err := b.collectItem(".link-to-dir")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// should be just the symlink itself, not the directory contents
+		if len(files) != 1 {
+			t.Fatalf("expected 1 symlink entry, got %d", len(files))
+		}
+		if files[0].RelPath != ".link-to-dir" {
+			t.Errorf("expected .link-to-dir, got %s", files[0].RelPath)
+		}
+	})
+
+	t.Run("symlink inside walked directory is captured without recursing", func(t *testing.T) {
+		// create directory with a symlink inside pointing to realdir
+		containerDir := filepath.Join(setup.homeDir, ".config", "withlinks")
+		createTestFile(t, filepath.Join(containerDir, "normal.txt"), "normal")
+		if err := os.Symlink(
+			filepath.Join(setup.homeDir, "realdir"),
+			filepath.Join(containerDir, "linked-dir"),
+		); err != nil {
+			t.Fatalf("failed to create inner symlink: %v", err)
+		}
+
+		files, err := b.collectItem(".config/withlinks")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// expect: normal.txt + linked-dir symlink entry (NOT inner.txt from realdir)
+		relPaths := make(map[string]bool)
+		for _, f := range files {
+			relPaths[f.RelPath] = true
+		}
+		if !relPaths[".config/withlinks/normal.txt"] {
+			t.Error("expected normal.txt in results")
+		}
+		if !relPaths[".config/withlinks/linked-dir"] {
+			t.Error("expected linked-dir symlink in results")
+		}
+		if relPaths[".config/withlinks/linked-dir/inner.txt"] {
+			t.Error("should NOT have recursed into symlinked directory")
+		}
+		if len(files) != 2 {
+			t.Errorf("expected 2 files, got %d: %v", len(files), relPaths)
+		}
+	})
+}
+
+func TestCreateEncryptedArchive_WriterError(t *testing.T) {
+	t.Parallel()
+
+	setup := setupTest(t)
+
+	cfg := &config.Config{
+		Backup: config.BackupConfig{BackupDir: setup.backupDir},
+	}
+	b := &Backup{
+		cfg:     cfg,
+		homeDir: setup.homeDir,
+		out:     output.New(output.ModeQuiet, false),
+	}
+
+	// file that doesn't exist — will cause writeArchive to fail for each entry
+	files := []FileInfo{
+		{
+			FullPath: filepath.Join(setup.homeDir, "nonexistent"),
+			RelPath:  "nonexistent",
+		},
+	}
+
+	enc := &failEncryptor{}
+	outputPath := filepath.Join(setup.backupDir, "test.tar.gz.age")
+	err := b.createEncryptedArchive(outputPath, files, enc)
+	if err == nil {
+		t.Fatal("expected error from failing encryptor")
+	}
+	if !strings.Contains(err.Error(), "mock encrypt failure") {
+		t.Errorf("expected mock encrypt failure in error, got: %v", err)
+	}
+}
+
+// failEncryptor is a mock that always fails EncryptReader.
+type failEncryptor struct{}
+
+func (f *failEncryptor) EncryptReader(_ io.Reader, _ string) error {
+	return errors.New("mock encrypt failure")
+}
+func (f *failEncryptor) Decrypt(_, _ string) error { return nil }
+func (f *failEncryptor) Available() bool           { return true }
 
 func TestRunCommand(t *testing.T) {
 	t.Parallel()

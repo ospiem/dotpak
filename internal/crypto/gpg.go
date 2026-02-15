@@ -3,6 +3,7 @@ package crypto
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 )
@@ -24,25 +25,23 @@ func (e *GPGEncryptor) Available() bool {
 	return HasGPG()
 }
 
-// Encrypt encrypts a file using GPG.
-func (e *GPGEncryptor) Encrypt(inputPath string) (string, error) {
-	outputPath := inputPath + ".gpg"
-
-	args := []string{"--encrypt", "--output", outputPath}
+// EncryptReader encrypts data from r and writes the result to outputPath.
+func (e *GPGEncryptor) EncryptReader(r io.Reader, outputPath string) error {
+	args := []string{"--batch", "--encrypt", "--output", outputPath}
 	if e.recipient != "" {
 		args = append(args, "--recipient", e.recipient)
 	}
-	args = append(args, inputPath)
 
 	cmd := exec.Command("gpg", args...)
+	cmd.Stdin = r
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("gpg encryption failed: %s", stderr.String())
+		return fmt.Errorf("gpg encryption failed: %s", stderr.String())
 	}
 
-	return outputPath, nil
+	return nil
 }
 
 // Decrypt decrypts a file using GPG.

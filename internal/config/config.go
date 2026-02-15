@@ -9,7 +9,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"github.com/ospiem/dotpak/internal/utils"
+	"github.com/ospiem/dotpak/internal/osutils"
 )
 
 // Config represents the main configuration structure.
@@ -56,7 +56,7 @@ type HostConfig struct {
 // DefaultConfig returns a config with sensible defaults.
 // If home directory cannot be determined, paths will use relative paths.
 func DefaultConfig() *Config {
-	home, err := utils.HomeDir()
+	home, err := osutils.HomeDir()
 	if err != nil {
 		// fall back to relative paths if home dir cannot be determined
 		home = "."
@@ -186,7 +186,7 @@ func DefaultConfig() *Config {
 // DefaultConfigPath returns the default config file path.
 // Returns empty string if home directory cannot be determined.
 func DefaultConfigPath() string {
-	home, err := utils.HomeDir()
+	home, err := osutils.HomeDir()
 	if err != nil {
 		return ""
 	}
@@ -243,7 +243,7 @@ func LoadWithProfile(path, profileName string) (*Config, error) {
 	}
 
 	// apply hostname-specific config if available
-	hostname, err := utils.Hostname()
+	hostname, err := osutils.Hostname()
 	if err == nil {
 		if hostCfg, ok := cfg.Hosts[hostname]; ok {
 			cfg.applyHostConfig(hostCfg)
