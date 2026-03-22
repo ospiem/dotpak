@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-03-22
+
+### Added
+
+- `--age-identity` flag for `diff`, `restore`, and `contents` commands — allows passing an age identity file path or `-` to read from stdin
+- Support for encrypted age identity files (e.g. protected by `age-plugin-yubikey`) via pipe: `age -d -i yubikey-identity encrypted-key.age | dotpak diff --age-identity - archive.age`
+
 ## [0.2.0] - 2026-02-15
 
 ### Security
