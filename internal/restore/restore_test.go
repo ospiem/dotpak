@@ -659,7 +659,7 @@ func TestListArchiveContents(t *testing.T) {
 
 	out := output.New(output.ModeNormal, false)
 
-	err := ListArchiveContents(nil, archivePath, out)
+	err := ListArchiveContents(nil, archivePath, "", out)
 	if err != nil {
 		t.Errorf("ListArchiveContents failed: %v", err)
 	}
@@ -681,7 +681,7 @@ func TestShowDiff(t *testing.T) {
 
 	out := output.New(output.ModeNormal, false)
 
-	err := ShowDiff(nil, archivePath, false, out)
+	err := ShowDiff(nil, archivePath, "", false, out)
 	if err != nil {
 		t.Errorf("ShowDiff failed: %v", err)
 	}

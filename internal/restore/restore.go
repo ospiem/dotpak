@@ -61,10 +61,11 @@ var Categories = map[string][]string{
 
 // Options holds restore options.
 type Options struct {
-	DryRun     bool
-	Force      bool
-	Categories []string
-	NoBackup   bool
+	DryRun      bool
+	Force       bool
+	Categories  []string
+	NoBackup    bool
+	AgeIdentity string
 }
 
 // Restore performs the restore operation.
@@ -246,7 +247,12 @@ func (r *Restore) decryptArchive(archivePath string) (string, error) {
 	outputPath := tmpFile.Name()
 
 	if strings.HasSuffix(archivePath, ".age") {
-		return decryptWithAge(archivePath, outputPath, resolveAgeIdentityFiles(r.cfg))
+		identityFiles, cleanup, resolveErr := ResolveAgeIdentity(r.opts.AgeIdentity, r.cfg)
+		if resolveErr != nil {
+			return "", resolveErr
+		}
+		defer cleanup()
+		return decryptWithAge(archivePath, outputPath, identityFiles)
 	}
 	if strings.HasSuffix(archivePath, ".gpg") {
 		return decryptWithGPG(archivePath, outputPath)
@@ -603,9 +609,8 @@ func extractFile(r io.Reader, path string, mode os.FileMode, maxSize int64) erro
 }
 
 // ListArchiveContents lists the contents of an archive.
-func ListArchiveContents(cfg *config.Config, archivePath string, out *output.Output) error {
+func ListArchiveContents(cfg *config.Config, archivePath, ageIdentity string, out *output.Output) error {
 	tarPath := archivePath
-	identityFiles := resolveAgeIdentityFiles(cfg)
 
 	if strings.HasSuffix(archivePath, ".age") || strings.HasSuffix(archivePath, ".gpg") {
 		tmpFile, err := osutils.CreateTempFile("dotpak-list-*.tar.gz")
@@ -619,6 +624,11 @@ func ListArchiveContents(cfg *config.Config, archivePath string, out *output.Out
 		var decryptErr error
 
 		if strings.HasSuffix(archivePath, ".age") {
+			identityFiles, cleanup, resolveErr := ResolveAgeIdentity(ageIdentity, cfg)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			defer cleanup()
 			decrypted, decryptErr = decryptWithAge(archivePath, tmpFile.Name(), identityFiles)
 		} else {
 			decrypted, decryptErr = decryptWithGPG(archivePath, tmpFile.Name())
@@ -670,13 +680,12 @@ type fileContent struct {
 }
 
 // ShowDiff shows differences between archive and current files.
-func ShowDiff(cfg *config.Config, archivePath string, verbose bool, out *output.Output) error {
+func ShowDiff(cfg *config.Config, archivePath, ageIdentity string, verbose bool, out *output.Output) error {
 	home, err := osutils.HomeDir()
 	if err != nil {
 		return err
 	}
 	tarPath := archivePath
-	identityFiles := resolveAgeIdentityFiles(cfg)
 
 	if strings.HasSuffix(archivePath, ".age") || strings.HasSuffix(archivePath, ".gpg") {
 		tmpFile, tmpErr := osutils.CreateTempFile("dotpak-diff-*.tar.gz")
@@ -690,6 +699,11 @@ func ShowDiff(cfg *config.Config, archivePath string, verbose bool, out *output.
 		var decryptErr error
 
 		if strings.HasSuffix(archivePath, ".age") {
+			identityFiles, cleanup, resolveErr := ResolveAgeIdentity(ageIdentity, cfg)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			defer cleanup()
 			decrypted, decryptErr = decryptWithAge(archivePath, tmpFile.Name(), identityFiles)
 		} else {
 			decrypted, decryptErr = decryptWithGPG(archivePath, tmpFile.Name())
