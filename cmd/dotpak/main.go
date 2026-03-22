@@ -159,13 +159,14 @@ Examples:
 
 func restoreCmd() *cobra.Command {
 	var (
-		dryRun    bool
-		force     bool
-		noBackup  bool
-		only      string
-		homebrew  bool
-		apt       bool
-		goRestore bool
+		dryRun      bool
+		force       bool
+		noBackup    bool
+		only        string
+		homebrew    bool
+		apt         bool
+		goRestore   bool
+		ageIdentity string
 	)
 
 	cmd := &cobra.Command{
@@ -240,10 +241,11 @@ Categories: shell, git, editor, ssh, gpg, python, node, rust, go, cloud, docker,
 			}
 
 			opts := &restore.Options{
-				DryRun:     dryRun,
-				Force:      force,
-				Categories: categories,
-				NoBackup:   noBackup,
+				DryRun:      dryRun,
+				Force:       force,
+				Categories:  categories,
+				NoBackup:    noBackup,
+				AgeIdentity: ageIdentity,
 			}
 
 			r := restore.New(cfg, opts, out)
@@ -271,6 +273,7 @@ Categories: shell, git, editor, ssh, gpg, python, node, rust, go, cloud, docker,
 	cmd.Flags().BoolVar(&homebrew, "homebrew", false, "Restore Homebrew packages only")
 	cmd.Flags().BoolVar(&apt, "apt", false, "Restore apt packages only (Linux)")
 	cmd.Flags().BoolVar(&goRestore, "go", false, "Restore Go packages only")
+	cmd.Flags().StringVar(&ageIdentity, "age-identity", "", "Age identity file for decryption ('-' for stdin)")
 
 	return cmd
 }
@@ -442,7 +445,9 @@ func configValidateCmd() *cobra.Command {
 }
 
 func diffCmd() *cobra.Command {
-	return &cobra.Command{
+	var ageIdentity string
+
+	cmd := &cobra.Command{
 		Use:   "diff <archive>",
 		Short: "Show differences between archive and current files",
 		Args:  cobra.ExactArgs(1),
@@ -452,13 +457,19 @@ func diffCmd() *cobra.Command {
 			if err != nil {
 				return outputError(out, err)
 			}
-			return restore.ShowDiff(cfg, args[0], verbose, out)
+			return restore.ShowDiff(cfg, args[0], ageIdentity, verbose, out)
 		},
 	}
+
+	cmd.Flags().StringVar(&ageIdentity, "age-identity", "", "Age identity file for decryption ('-' for stdin)")
+
+	return cmd
 }
 
 func contentsCmd() *cobra.Command {
-	return &cobra.Command{
+	var ageIdentity string
+
+	cmd := &cobra.Command{
 		Use:   "contents <archive>",
 		Short: "List archive contents",
 		Args:  cobra.ExactArgs(1),
@@ -468,9 +479,13 @@ func contentsCmd() *cobra.Command {
 			if err != nil {
 				return outputError(out, err)
 			}
-			return restore.ListArchiveContents(cfg, args[0], out)
+			return restore.ListArchiveContents(cfg, args[0], ageIdentity, out)
 		},
 	}
+
+	cmd.Flags().StringVar(&ageIdentity, "age-identity", "", "Age identity file for decryption ('-' for stdin)")
+
+	return cmd
 }
 
 func cronCmd() *cobra.Command {
