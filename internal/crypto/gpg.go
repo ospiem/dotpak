@@ -2,9 +2,8 @@ package crypto
 
 import (
 	"bytes"
-	"fmt"
+	"errors"
 	"io"
-	"os"
 	"os/exec"
 )
 
@@ -14,10 +13,10 @@ type GPGEncryptor struct {
 }
 
 // NewGPGEncryptor creates a new GPGEncryptor.
-func NewGPGEncryptor(opts Options) (*GPGEncryptor, error) {
+func NewGPGEncryptor(opts Options) *GPGEncryptor {
 	return &GPGEncryptor{
 		recipient: opts.GPGRecipient,
-	}, nil
+	}
 }
 
 // Available returns true if gpg is installed.
@@ -27,33 +26,27 @@ func (e *GPGEncryptor) Available() bool {
 
 // EncryptReader encrypts data from r and writes the result to outputPath.
 func (e *GPGEncryptor) EncryptReader(r io.Reader, outputPath string) error {
-	args := []string{"--batch", "--encrypt", "--output", outputPath}
-	if e.recipient != "" {
-		args = append(args, "--recipient", e.recipient)
+	if e.recipient == "" {
+		return errors.New("gpg recipient not specified")
 	}
 
-	cmd := exec.Command("gpg", args...)
+	//nolint:gosec // g204: recipient is a gpg key id from config, passed as a flag argument
+	cmd := exec.Command("gpg", "--batch", "--yes", "--encrypt", "--output", outputPath, "--recipient", e.recipient)
 	cmd.Stdin = r
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("gpg encryption failed: %s", stderr.String())
+		return cmdError("gpg encryption failed", err, &stderr)
 	}
 
 	return nil
 }
 
-// Decrypt decrypts a file using GPG.
-func (e *GPGEncryptor) Decrypt(inputPath, outputPath string) error {
-	cmd := exec.Command("gpg", "--decrypt", "--output", outputPath, inputPath)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	cmd.Stdin = os.Stdin // allow passphrase input
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("gpg decryption failed: %s", stderr.String())
-	}
-
-	return nil
+// DecryptReader streams the decrypted contents of inputPath. Passphrase entry
+// goes through the gpg agent/pinentry; --batch keeps gpg from blocking on a
+// tty so non-interactive runs fail cleanly instead of hanging.
+func (e *GPGEncryptor) DecryptReader(inputPath string) (io.ReadCloser, error) {
+	cmd := exec.Command("gpg", "--batch", "--decrypt", "--", inputPath)
+	return startCmdReader("gpg decryption failed", cmd)
 }

@@ -1,9 +1,11 @@
-// Package osutils provide shared utility functions for dotpak.
+// Package osutils provides shared utility functions for dotpak.
 package osutils
 
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 )
 
 // FormatSize formats a byte size as a human-readable string.
@@ -35,6 +37,22 @@ func HomeDir() (string, error) {
 	return home, nil
 }
 
+// ExpandPath expands a leading "~" or "~/" to the user's home directory.
+// The path is returned unchanged if home cannot be determined.
+func ExpandPath(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := HomeDir()
+	if err != nil {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
+}
+
 // Hostname returns the hostname without the domain part, or an error.
 func Hostname() (string, error) {
 	hostname, err := os.Hostname()
@@ -48,6 +66,3 @@ func Hostname() (string, error) {
 	}
 	return hostname, nil
 }
-
-const MaxExtractFileSize = 1 << 30   // 1GB
-const MaxExtractTotalSize = 10 << 30 // 10GB

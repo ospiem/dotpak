@@ -8,8 +8,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ospiem/dotpak/internal/crypto"
 	"github.com/ospiem/dotpak/internal/osutils"
 )
+
+// ArchivePrefix is the file name prefix of every dotpak archive.
+const ArchivePrefix = "dotfiles-"
+
+// TimestampFormat is the layout of the timestamp embedded in archive names.
+const TimestampFormat = "20060102_150405"
 
 // Metadata represents backup metadata.
 type Metadata struct {
@@ -59,14 +66,13 @@ type ListResult struct {
 
 // BackupInfo represents info about a single backup.
 type BackupInfo struct {
-	Archive      string `json:"archive"`
-	Timestamp    string `json:"timestamp"`
-	Size         int64  `json:"size"`
-	Encrypted    bool   `json:"encrypted"`
-	Encryption   string `json:"encryption,omitempty"`
-	Hostname     string `json:"hostname,omitempty"`
-	FileCount    int    `json:"file_count,omitempty"`
-	MetadataPath string `json:"metadata_path,omitempty"`
+	Archive    string `json:"archive"`
+	Timestamp  string `json:"timestamp"`
+	Size       int64  `json:"size"`
+	Encrypted  bool   `json:"encrypted"`
+	Encryption string `json:"encryption,omitempty"`
+	Hostname   string `json:"hostname,omitempty"`
+	FileCount  int    `json:"file_count,omitempty"`
 }
 
 // New creates a new Metadata with current timestamp and hostname.
@@ -112,11 +118,8 @@ func (m *Metadata) Save(path string) error {
 func GetMetadataPath(archivePath string) string {
 	base := archivePath
 
-	for _, ext := range []string{".age", ".gpg"} {
-		if before, ok := strings.CutSuffix(base, ext); ok {
-			base = before
-			break
-		}
+	if method := crypto.DetectMethod(base); method != crypto.MethodNone {
+		base = strings.TrimSuffix(base, method.Extension())
 	}
 
 	switch {
@@ -129,23 +132,16 @@ func GetMetadataPath(archivePath string) string {
 	return base + ".json"
 }
 
-// GenerateArchiveName creates an archive name with timestamp.
-func GenerateArchiveName(backupDir string, encrypted bool, method string) string {
-	timestamp := time.Now().Format("20060102_150405")
-	name := "dotfiles-" + timestamp + ".tar.gz"
-
-	if encrypted {
-		switch method {
-		case "age":
-			name += ".age"
-		case "gpg":
-			name += ".gpg"
-		}
-	}
-
+// GenerateArchiveName creates a timestamped archive path in backupDir, with
+// the encryption extension appended for encrypted methods.
+func GenerateArchiveName(backupDir string, method crypto.Method) string {
+	timestamp := time.Now().Format(TimestampFormat)
+	name := ArchivePrefix + timestamp + ".tar.gz" + method.Extension()
 	return filepath.Join(backupDir, name)
 }
 
+// GetOSVersion returns a human-readable OS name and version, or "" if unknown.
+//
 //nolint:nestif // OS version parsing requires navigating plist/os-release structure
 func GetOSVersion() string {
 	if data, err := os.ReadFile("/System/Library/CoreServices/SystemVersion.plist"); err == nil {

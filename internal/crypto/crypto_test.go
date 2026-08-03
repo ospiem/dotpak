@@ -33,16 +33,37 @@ func TestDetectMethod(t *testing.T) {
 	}
 }
 
-func TestHasAge(t *testing.T) {
+func TestMethodExtension(t *testing.T) {
 	t.Parallel()
-	// just verify it doesn't panic
-	_ = HasAge()
+
+	tests := []struct {
+		method Method
+		want   string
+	}{
+		{MethodAge, ".age"},
+		{MethodGPG, ".gpg"},
+		{MethodNone, ""},
+	}
+
+	for _, tt := range tests {
+		if got := tt.method.Extension(); got != tt.want {
+			t.Errorf("Method(%q).Extension() = %q, want %q", tt.method, got, tt.want)
+		}
+	}
 }
 
-func TestHasGPG(t *testing.T) {
+func TestIsEncryptedPath(t *testing.T) {
 	t.Parallel()
-	// just verify it doesn't panic
-	_ = HasGPG()
+
+	if !IsEncryptedPath("backup.tar.gz.age") {
+		t.Error("expected .age path to be detected as encrypted")
+	}
+	if !IsEncryptedPath("backup.tar.gz.gpg") {
+		t.Error("expected .gpg path to be detected as encrypted")
+	}
+	if IsEncryptedPath("backup.tar.gz") {
+		t.Error("expected .tar.gz path to be detected as unencrypted")
+	}
 }
 
 func TestNewEncryptor(t *testing.T) {
@@ -50,27 +71,29 @@ func TestNewEncryptor(t *testing.T) {
 
 	t.Run("age encryptor", func(t *testing.T) {
 		enc, err := NewEncryptor(MethodAge, Options{})
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
-		if enc == nil {
-			t.Error("expected non-nil encryptor")
-		}
-		if _, ok := enc.(*AgeEncryptor); !ok {
-			t.Error("expected AgeEncryptor type")
+		if HasAge() {
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if _, ok := enc.(*AgeEncryptor); !ok {
+				t.Error("expected AgeEncryptor type")
+			}
+		} else if err == nil {
+			t.Error("expected error when age is not installed")
 		}
 	})
 
 	t.Run("gpg encryptor", func(t *testing.T) {
 		enc, err := NewEncryptor(MethodGPG, Options{})
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
-		if enc == nil {
-			t.Error("expected non-nil encryptor")
-		}
-		if _, ok := enc.(*GPGEncryptor); !ok {
-			t.Error("expected GPGEncryptor type")
+		if HasGPG() {
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if _, ok := enc.(*GPGEncryptor); !ok {
+				t.Error("expected GPGEncryptor type")
+			}
+		} else if err == nil {
+			t.Error("expected error when gpg is not installed")
 		}
 	})
 
@@ -95,27 +118,12 @@ func TestNewEncryptor(t *testing.T) {
 	})
 }
 
-func TestAgeEncryptor_Available(t *testing.T) {
-	t.Parallel()
-
-	enc, err := NewAgeEncryptor(Options{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// result depends on whether age is installed
-	_ = enc.Available()
-}
-
 func TestAgeEncryptor_EncryptReaderWithoutRecipients(t *testing.T) {
 	t.Parallel()
 
-	enc, err := NewAgeEncryptor(Options{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	enc := NewAgeEncryptor(Options{})
 
-	err = enc.EncryptReader(strings.NewReader("test"), "/tmp/test.tar.gz.age")
+	err := enc.EncryptReader(strings.NewReader("test"), filepath.Join(t.TempDir(), "test.tar.gz.age"))
 	if err == nil {
 		t.Error("expected error when recipients file not specified")
 	}
@@ -124,69 +132,43 @@ func TestAgeEncryptor_EncryptReaderWithoutRecipients(t *testing.T) {
 func TestAgeEncryptor_EncryptReaderWithNonexistentRecipients(t *testing.T) {
 	t.Parallel()
 
-	enc, err := NewAgeEncryptor(Options{
+	enc := NewAgeEncryptor(Options{
 		AgeRecipientsFile: "/nonexistent/recipients.txt",
 	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 
-	err = enc.EncryptReader(strings.NewReader("test"), "/tmp/test.tar.gz.age")
+	err := enc.EncryptReader(strings.NewReader("test"), filepath.Join(t.TempDir(), "test.tar.gz.age"))
 	if err == nil {
 		t.Error("expected error when recipients file not found")
 	}
 }
 
-func TestAgeEncryptor_DecryptWithNoIdentity(t *testing.T) {
+func TestGPGEncryptor_EncryptReaderWithoutRecipient(t *testing.T) {
+	t.Parallel()
+
+	enc := NewGPGEncryptor(Options{})
+
+	err := enc.EncryptReader(strings.NewReader("test"), filepath.Join(t.TempDir(), "test.tar.gz.gpg"))
+	if err == nil {
+		t.Error("expected error when gpg recipient not specified")
+	}
+}
+
+func TestAgeEncryptor_DecryptReaderWithNoIdentity(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
 
-	enc, err := NewAgeEncryptor(Options{
+	enc := NewAgeEncryptor(Options{
 		AgeIdentityFiles: []string{
 			filepath.Join(tmpDir, "nonexistent1.txt"),
 			filepath.Join(tmpDir, "nonexistent2.txt"),
 		},
 	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 
-	err = enc.Decrypt("/tmp/test.tar.gz.age", "/tmp/output.tar.gz")
+	rc, err := enc.DecryptReader(filepath.Join(tmpDir, "test.tar.gz.age"))
 	if err == nil {
+		_ = rc.Close()
 		t.Error("expected error when no identity file found")
-	}
-}
-
-func TestGPGEncryptor_Available(t *testing.T) {
-	t.Parallel()
-
-	enc, err := NewGPGEncryptor(Options{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// result depends on whether gpg is installed
-	_ = enc.Available()
-}
-
-func TestOptions(t *testing.T) {
-	t.Parallel()
-
-	opts := Options{
-		AgeRecipientsFile: "/path/to/recipients.txt",
-		AgeIdentityFiles:  []string{"/path/to/identity1.txt", "/path/to/identity2.txt"},
-		GPGRecipient:      "user@example.com",
-	}
-
-	if opts.AgeRecipientsFile != "/path/to/recipients.txt" {
-		t.Errorf("unexpected AgeRecipientsFile: %s", opts.AgeRecipientsFile)
-	}
-	if len(opts.AgeIdentityFiles) != 2 {
-		t.Errorf("expected 2 identity files, got %d", len(opts.AgeIdentityFiles))
-	}
-	if opts.GPGRecipient != "user@example.com" {
-		t.Errorf("unexpected GPGRecipient: %s", opts.GPGRecipient)
 	}
 }
 
@@ -213,15 +195,12 @@ func TestAgeEncryptor_FindIdentityFile(t *testing.T) {
 		t.Fatalf("failed to create identity file: %v", err)
 	}
 
-	enc, err := NewAgeEncryptor(Options{
+	enc := NewAgeEncryptor(Options{
 		AgeIdentityFiles: []string{
 			filepath.Join(tmpDir, "nonexistent.txt"),
 			identityFile,
 		},
 	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 
 	found, err := enc.findIdentityFile()
 	if err != nil {
@@ -235,10 +214,7 @@ func TestAgeEncryptor_FindIdentityFile(t *testing.T) {
 func TestAgeEncryptor_NoDefaultIdentityFiles(t *testing.T) {
 	t.Parallel()
 
-	enc, err := NewAgeEncryptor(Options{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	enc := NewAgeEncryptor(Options{})
 
 	// no default identity files should be populated - user must explicitly configure them
 	if len(enc.identityFiles) != 0 {

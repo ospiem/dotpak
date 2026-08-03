@@ -299,86 +299,130 @@ patterns = ["*.tmp", "*.cache"]
 	})
 }
 
-func TestExpandPath(t *testing.T) {
+func TestNormalizeItemPath(t *testing.T) {
 	t.Parallel()
 
-	home, _ := os.UserHomeDir()
+	const home = "/home/user"
 
 	tests := []struct {
-		name     string
-		input    string
-		contains string // check if result contains this
+		name  string
+		input string
+		want  string
 	}{
-		{
-			name:     "expands tilde prefix",
-			input:    "~/backups",
-			contains: home,
-		},
-		{
-			name:     "leaves absolute path unchanged",
-			input:    "/usr/local/bin",
-			contains: "/usr/local/bin",
-		},
-		{
-			name:     "leaves relative path unchanged",
-			input:    "relative/path",
-			contains: "relative/path",
-		},
-		{
-			name:     "only expands leading tilde",
-			input:    "path/with/~/tilde",
-			contains: "path/with/~/tilde",
-		},
+		{"relative path unchanged", ".zshrc", ".zshrc"},
+		{"nested relative path unchanged", ".config/nvim", ".config/nvim"},
+		{"tilde prefix stripped", "~/.zshrc", ".zshrc"},
+		{"HOME prefix stripped", "$HOME/.config/git", ".config/git"},
+		{"absolute under home made relative", "/home/user/.ssh", ".ssh"},
+		{"absolute outside home left cleaned", "/etc/hosts", "/etc/hosts"},
+		{"trailing slash cleaned", "~/.config/nvim/", ".config/nvim"},
+		{"whitespace trimmed", "  ~/.vimrc ", ".vimrc"},
+		{"bare tilde means home itself", "~", "."},
+		{"empty stays empty", "", ""},
+		{"home boundary not prefix-matched", "/home/username/.zshrc", "/home/username/.zshrc"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := expandPath(tt.input)
-			if !strings.Contains(result, tt.contains) {
-				t.Errorf("expected result to contain %q, got %q", tt.contains, result)
+			if got := normalizeItemPath(tt.input, home); got != tt.want {
+				t.Errorf("normalizeItemPath(%q, %q) = %q, want %q", tt.input, home, got, tt.want)
 			}
 		})
 	}
+
+	t.Run("unknown home keeps absolute path", func(t *testing.T) {
+		if got := normalizeItemPath("/home/user/.ssh", ""); got != "/home/user/.ssh" {
+			t.Errorf("expected absolute path unchanged with unknown home, got %q", got)
+		}
+	})
+
+	t.Run("unknown home still strips tilde", func(t *testing.T) {
+		if got := normalizeItemPath("~/.zshrc", ""); got != ".zshrc" {
+			t.Errorf("expected tilde stripped with unknown home, got %q", got)
+		}
+	})
 }
 
-func TestGetBackupItems(t *testing.T) {
+func TestLoadNormalizesItems(t *testing.T) {
 	t.Parallel()
 
-	cfg := &Config{
-		Items: []string{".zshrc", ".config/nvim", ".vimrc"},
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.toml")
+
+	content := `
+items = ["~/.zshrc", ".config/nvim"]
+sensitive = ["$HOME/.ssh"]
+
+[backup]
+backup_dir = "~/backups"
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
 	}
 
-	items := cfg.GetBackupItems()
-
-	if len(items) != 3 {
-		t.Errorf("expected 3 items, got %d", len(items))
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 
-	paths := make(map[string]bool)
-	for _, item := range items {
-		paths[item.Path] = true
+	if !slices.Contains(cfg.Items, ".zshrc") {
+		t.Errorf("expected ~/.zshrc normalized to .zshrc, got %v", cfg.Items)
 	}
-
-	if !paths[".config/nvim"] {
-		t.Error("expected .config/nvim to exist")
+	if !slices.Contains(cfg.Items, ".config/nvim") {
+		t.Errorf("expected .config/nvim unchanged, got %v", cfg.Items)
 	}
-	if !paths[".zshrc"] {
-		t.Error("expected .zshrc to exist")
+	if !slices.Contains(cfg.Sensitive, ".ssh") {
+		t.Errorf("expected $HOME/.ssh normalized to .ssh, got %v", cfg.Sensitive)
 	}
 }
 
-func TestGetSensitiveItems(t *testing.T) {
+func TestLoadDefaultsForOmittedKeys(t *testing.T) {
 	t.Parallel()
 
-	cfg := &Config{
-		Sensitive: []string{".ssh/id_ed25519", ".aws/credentials", ".kube"},
-	}
+	t.Run("omitted backup_dir keeps default", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		configPath := filepath.Join(tmpDir, "config.toml")
 
-	items := cfg.GetSensitiveItems()
+		content := `
+items = [".zshrc"]
+`
+		if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
 
-	if len(items) != 3 {
-		t.Errorf("expected 3 items, got %d", len(items))
-	}
+		cfg, err := Load(configPath)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Backup.BackupDir == "" {
+			t.Error("expected omitted backup_dir to keep the default, got empty string")
+		}
+		if len(cfg.Items) != 1 {
+			t.Errorf("expected items from file to replace defaults, got %d items", len(cfg.Items))
+		}
+	})
+
+	t.Run("explicit max_backups zero is honored", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		configPath := filepath.Join(tmpDir, "config.toml")
+
+		content := `
+[backup]
+backup_dir = "~/backups"
+max_backups = 0
+`
+		if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg, err := Load(configPath)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Backup.MaxBackups != 0 {
+			t.Errorf("expected max_backups=0 (keep all) to be honored, got %d", cfg.Backup.MaxBackups)
+		}
+	})
 }
 
 func TestHostConfig(t *testing.T) {
@@ -417,17 +461,5 @@ extra_items = [".config/host-specific"]
 	found := slices.Contains(cfg.Items, ".config/host-specific")
 	if !found {
 		t.Error("expected host-specific item to be applied")
-	}
-}
-
-func TestBackupItem(t *testing.T) {
-	t.Parallel()
-
-	item := BackupItem{
-		Path: ".config/nvim",
-	}
-
-	if item.Path != ".config/nvim" {
-		t.Errorf("expected path .config/nvim, got %s", item.Path)
 	}
 }

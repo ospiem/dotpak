@@ -16,12 +16,11 @@ type AgeEncryptor struct {
 }
 
 // NewAgeEncryptor creates a new AgeEncryptor.
-func NewAgeEncryptor(opts Options) (*AgeEncryptor, error) {
-	enc := &AgeEncryptor{
+func NewAgeEncryptor(opts Options) *AgeEncryptor {
+	return &AgeEncryptor{
 		recipientsFile: opts.AgeRecipientsFile,
 		identityFiles:  opts.AgeIdentityFiles,
 	}
-	return enc, nil
 }
 
 // Available returns true if age is installed.
@@ -46,28 +45,21 @@ func (e *AgeEncryptor) EncryptReader(r io.Reader, outputPath string) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("age encryption failed: %s", stderr.String())
+		return cmdError("age encryption failed", err, &stderr)
 	}
 
 	return nil
 }
 
-// Decrypt decrypts a file using age.
-func (e *AgeEncryptor) Decrypt(inputPath, outputPath string) error {
+// DecryptReader streams the decrypted contents of inputPath.
+func (e *AgeEncryptor) DecryptReader(inputPath string) (io.ReadCloser, error) {
 	identityFile, err := e.findIdentityFile()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	cmd := exec.Command("age", "-d", "-i", identityFile, "-o", outputPath, inputPath)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if runErr := cmd.Run(); runErr != nil {
-		return fmt.Errorf("age decryption failed: %s", stderr.String())
-	}
-
-	return nil
+	cmd := exec.Command("age", "-d", "-i", identityFile, "--", inputPath)
+	return startCmdReader("age decryption failed", cmd)
 }
 
 func (e *AgeEncryptor) findIdentityFile() (string, error) {

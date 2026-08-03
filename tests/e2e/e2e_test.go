@@ -118,7 +118,7 @@ func findBinary(t *testing.T) string {
 
 	// look in common locations
 	locations := []string{
-		"../../dotpak", // from tests/integration
+		"../../dotpak", // from tests/e2e
 		"./dotpak",     // current directory
 		"/app/dotpak",  // docker location
 	}
@@ -129,8 +129,59 @@ func findBinary(t *testing.T) string {
 		}
 	}
 
-	t.Skip("dotpak binary not found - run 'make build-go' first")
+	t.Skip("dotpak binary not found - run 'make build' first")
 	return ""
+}
+
+// skipIfShort skips integration tests in -short mode.
+func skipIfShort(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+}
+
+// readArchiveHeaders reads all tar headers from a tar.gz archive, failing the
+// test on any read error.
+func readArchiveHeaders(t *testing.T, path string) []*tar.Header {
+	t.Helper()
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("opening archive %s: %v", path, err)
+	}
+	defer f.Close()
+
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("reading archive gzip %s: %v", path, err)
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+	var headers []*tar.Header
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("reading archive tar %s: %v", path, err)
+		}
+		headers = append(headers, header)
+	}
+	return headers
+}
+
+// readArchiveNames returns the set of entry names in a tar.gz archive.
+func readArchiveNames(t *testing.T, path string) map[string]bool {
+	t.Helper()
+
+	names := make(map[string]bool)
+	for _, h := range readArchiveHeaders(t, path) {
+		names[h.Name] = true
+	}
+	return names
 }
 
 // createMockDotfiles creates standard mock dotfiles.
@@ -282,9 +333,7 @@ func (e *testEnv) runList(t *testing.T) *ListResult {
 }
 
 func TestBackupCreatesArchive(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -311,9 +360,7 @@ func TestBackupCreatesArchive(t *testing.T) {
 }
 
 func TestBackupArchiveContainsFiles(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -326,32 +373,7 @@ func TestBackupArchiveContainsFiles(t *testing.T) {
 		t.Fatalf("Backup failed: %s", result.Error)
 	}
 
-	// read archive contents
-	f, err := os.Open(result.Archive)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-
-	gzr, err := gzip.NewReader(f)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer gzr.Close()
-
-	tr := tar.NewReader(gzr)
-	files := make(map[string]bool)
-
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		files[header.Name] = true
-	}
+	files := readArchiveNames(t, result.Archive)
 
 	expectedFiles := []string{".zshrc", ".gitconfig"}
 	for _, f := range expectedFiles {
@@ -362,9 +384,7 @@ func TestBackupArchiveContainsFiles(t *testing.T) {
 }
 
 func TestBackupCreatesMetadata(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -410,9 +430,7 @@ func TestBackupCreatesMetadata(t *testing.T) {
 }
 
 func TestFullBackupRestoreCycle(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -451,9 +469,7 @@ func TestFullBackupRestoreCycle(t *testing.T) {
 }
 
 func TestSensitiveFilesExcludedWithoutEncryption(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -488,30 +504,15 @@ patterns = []
 	}
 
 	// verify sensitive files not in archive
-	f, _ := os.Open(result.Archive)
-	defer f.Close()
-	gzr, _ := gzip.NewReader(f)
-	defer gzr.Close()
-	tr := tar.NewReader(gzr)
-
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(header.Name, "id_ed25519") || strings.Contains(header.Name, "credentials") {
-			t.Errorf("Sensitive file found in unencrypted archive: %s", header.Name)
+	for name := range readArchiveNames(t, result.Archive) {
+		if strings.Contains(name, "id_ed25519") || strings.Contains(name, "credentials") {
+			t.Errorf("Sensitive file found in unencrypted archive: %s", name)
 		}
 	}
 }
 
 func TestDryRunDoesNotCreateArchive(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -534,9 +535,7 @@ func TestDryRunDoesNotCreateArchive(t *testing.T) {
 }
 
 func TestListCommand(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -566,17 +565,13 @@ func TestListCommand(t *testing.T) {
 			break
 		}
 	}
-	if !found && len(result.Backups) > 0 {
-		// at least verify list returned something
-		t.Logf("Backup archive: %s", result1.Archive)
-		t.Logf("Listed backups: %v", result.Backups)
+	if !found {
+		t.Errorf("backup %s missing from list output: %v", result1.Archive, result.Backups)
 	}
 }
 
 func TestExcludePatterns(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -624,32 +619,17 @@ patterns = ["*.log", "__pycache__", "*.pyc"]
 	}
 
 	// verify excluded files not in archive
-	f, _ := os.Open(result.Archive)
-	defer f.Close()
-	gzr, _ := gzip.NewReader(f)
-	defer gzr.Close()
-	tr := tar.NewReader(gzr)
-
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(header.Name, "__pycache__") ||
-			strings.HasSuffix(header.Name, ".pyc") ||
-			strings.HasSuffix(header.Name, ".log") {
-			t.Errorf("Excluded file found in archive: %s", header.Name)
+	for name := range readArchiveNames(t, result.Archive) {
+		if strings.Contains(name, "__pycache__") ||
+			strings.HasSuffix(name, ".pyc") ||
+			strings.HasSuffix(name, ".log") {
+			t.Errorf("Excluded file found in archive: %s", name)
 		}
 	}
 }
 
 func TestUnicodeFilenames(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -681,9 +661,7 @@ encryption = "none"
 }
 
 func TestFilePermissions(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -710,34 +688,23 @@ encryption = "none"
 	}
 
 	// check permissions in archive
-	f, _ := os.Open(result.Archive)
-	defer f.Close()
-	gzr, _ := gzip.NewReader(f)
-	defer gzr.Close()
-	tr := tar.NewReader(gzr)
-
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
+	found := false
+	for _, header := range readArchiveHeaders(t, result.Archive) {
 		if header.Name == ".private_config" {
-			mode := header.Mode & 0777
-			if mode != 0600 {
+			found = true
+			if mode := header.Mode & 0777; mode != 0600 {
 				t.Errorf("Expected mode 0600, got %o", mode)
 			}
 			break
 		}
 	}
+	if !found {
+		t.Error(".private_config missing from archive")
+	}
 }
 
 func TestLargeFile(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -773,9 +740,7 @@ encryption = "none"
 }
 
 func TestMaxBackupsCleanup(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -805,9 +770,7 @@ encryption = "none"
 }
 
 func TestRestoreDryRun(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -840,9 +803,7 @@ func TestRestoreDryRun(t *testing.T) {
 }
 
 func TestRestoreSafetyBackup(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -945,9 +906,7 @@ func (e *testEnv) runDiff(t *testing.T, archive string) (string, error) {
 }
 
 func TestRecursiveDirectories(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -968,32 +927,7 @@ encryption = "none"
 		t.Fatalf("Backup failed: %s", result.Error)
 	}
 
-	// read archive contents
-	f, err := os.Open(result.Archive)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-
-	gzr, err := gzip.NewReader(f)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer gzr.Close()
-
-	tr := tar.NewReader(gzr)
-	files := make(map[string]bool)
-
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		files[header.Name] = true
-	}
+	files := readArchiveNames(t, result.Archive)
 
 	// check for nested files
 	hasNvimInit := false
@@ -1016,9 +950,7 @@ encryption = "none"
 }
 
 func TestContentsCommand(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -1041,9 +973,7 @@ func TestContentsCommand(t *testing.T) {
 }
 
 func TestDiffCommand(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -1074,9 +1004,7 @@ func TestDiffCommand(t *testing.T) {
 }
 
 func TestSpacesInPaths(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -1097,31 +1025,9 @@ encryption = "none"
 		t.Fatalf("Backup failed: %s", result.Error)
 	}
 
-	// read archive contents
-	f, err := os.Open(result.Archive)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-
-	gzr, err := gzip.NewReader(f)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer gzr.Close()
-
-	tr := tar.NewReader(gzr)
-
 	hasSpacesDir := false
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(header.Name, "app with spaces") {
+	for name := range readArchiveNames(t, result.Archive) {
+		if strings.Contains(name, "app with spaces") {
 			hasSpacesDir = true
 			break
 		}

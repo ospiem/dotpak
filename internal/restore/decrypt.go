@@ -11,35 +11,33 @@ import (
 	"github.com/ospiem/dotpak/internal/osutils"
 )
 
-func decryptWithAge(inputPath, outputPath string, identityFiles []string) (string, error) {
-	identityFiles = normalizeIdentityFiles(identityFiles)
-	enc, err := crypto.NewAgeEncryptor(crypto.Options{
+// openArchiveStream returns a reader over the (possibly decrypted) tar.gz
+// stream of archivePath. Decryption is streamed, so plaintext never touches
+// disk. The caller must Close the reader and check the error: for encrypted
+// archives it reports decryption failure.
+func openArchiveStream(archivePath string, identityFiles []string) (io.ReadCloser, error) {
+	method := crypto.DetectMethod(archivePath)
+	if method == crypto.MethodNone {
+		return os.Open(archivePath)
+	}
+
+	enc, err := crypto.NewEncryptor(method, crypto.Options{
 		AgeIdentityFiles: identityFiles,
 	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	if err = enc.Decrypt(inputPath, outputPath); err != nil {
-		return "", err
-	}
-	return outputPath, nil
-}
-
-func decryptWithGPG(inputPath, outputPath string) (string, error) {
-	enc, err := crypto.NewGPGEncryptor(crypto.Options{})
-	if err != nil {
-		return "", err
-	}
-	if err = enc.Decrypt(inputPath, outputPath); err != nil {
-		return "", err
-	}
-	return outputPath, nil
+	return enc.DecryptReader(archivePath)
 }
 
 // ResolveAgeIdentity resolves identity files from a CLI override or config.
-// When override is "-", identity is read from stdin into a temp file.
-// When override is a path, it is used directly (supports process substitution).
-// Returns the identity file list and a cleanup function for temp files.
+// When override is "-", the identity is read from stdin; any other value is
+// used as a path directly (so process substitution works); "" falls back to
+// the config.
+//
+// A stdin identity is staged in a 0600 file under ~/.cache/dotpak/tmp: one run
+// decrypts the archive more than once (safety-backup scan, then extraction)
+// while stdin can only be read once. The returned cleanup removes that file.
 func ResolveAgeIdentity(override string, cfg *config.Config) ([]string, func(), error) {
 	noop := func() {}
 
@@ -49,15 +47,19 @@ func ResolveAgeIdentity(override string, cfg *config.Config) ([]string, func(), 
 			return nil, noop, fmt.Errorf("creating temp file for identity: %w", err)
 		}
 
-		if _, copyErr := io.Copy(tmpFile, os.Stdin); copyErr != nil {
-			_ = tmpFile.Close()
-			_ = os.Remove(tmpFile.Name())
-			return nil, noop, fmt.Errorf("reading identity from stdin: %w", copyErr)
-		}
-		_ = tmpFile.Close()
-
 		path := tmpFile.Name()
 		cleanup := func() { _ = os.Remove(path) }
+
+		if _, copyErr := io.Copy(tmpFile, os.Stdin); copyErr != nil {
+			_ = tmpFile.Close()
+			cleanup()
+			return nil, noop, fmt.Errorf("reading identity from stdin: %w", copyErr)
+		}
+		if closeErr := tmpFile.Close(); closeErr != nil {
+			cleanup()
+			return nil, noop, fmt.Errorf("writing identity file: %w", closeErr)
+		}
+
 		return []string{path}, cleanup, nil
 	}
 
@@ -66,6 +68,16 @@ func ResolveAgeIdentity(override string, cfg *config.Config) ([]string, func(), 
 	}
 
 	return resolveAgeIdentityFiles(cfg), noop, nil
+}
+
+// resolveAgeIdentityFor resolves the identity files needed to read archivePath.
+// Archives that are not age-encrypted need none, so stdin is left untouched for
+// them.
+func resolveAgeIdentityFor(archivePath, override string, cfg *config.Config) ([]string, func(), error) {
+	if crypto.DetectMethod(archivePath) != crypto.MethodAge {
+		return nil, func() {}, nil
+	}
+	return ResolveAgeIdentity(override, cfg)
 }
 
 func resolveAgeIdentityFiles(cfg *config.Config) []string {

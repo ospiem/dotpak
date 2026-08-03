@@ -9,9 +9,7 @@ import (
 )
 
 func TestDefaultNoEncryption(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -37,9 +35,7 @@ backup_dir = "` + env.backupDir + `"
 }
 
 func TestExplicitAgeEncryption(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	if _, err := exec.LookPath("age"); err != nil {
@@ -81,9 +77,7 @@ age_recipients = "` + recipientsFile + `"
 }
 
 func TestNoEncryptFlag(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	if _, err := exec.LookPath("age-keygen"); err != nil {
@@ -123,9 +117,7 @@ age_recipients = "` + recipientsFile + `"
 }
 
 func TestSensitiveFilesWithEncryption(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	if _, err := exec.LookPath("age-keygen"); err != nil {
@@ -165,9 +157,7 @@ age_recipients = "` + recipientsFile + `"
 }
 
 func TestCustomRecipientsFile(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	if _, err := exec.LookPath("age-keygen"); err != nil {
@@ -220,9 +210,7 @@ encryption = "none"
 }
 
 func TestMissingRecipientsFile(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	env := setupTestEnv(t)
@@ -246,9 +234,7 @@ age_recipients = "/nonexistent/recipients.txt"
 }
 
 func TestAgeEncryptDecryptCycle(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	if _, err := exec.LookPath("age"); err != nil {
@@ -345,9 +331,7 @@ func generateAgeKeys(t *testing.T, homeDir string) (keysFile, recipientsFile str
 }
 
 func TestGPGEncryptionConfig(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	skipIfShort(t)
 	t.Parallel()
 
 	if _, err := exec.LookPath("gpg"); err != nil {
