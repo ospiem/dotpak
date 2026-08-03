@@ -1,6 +1,8 @@
 package restore
 
 import (
+	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,6 +30,32 @@ func openArchiveStream(archivePath string, identityFiles []string) (io.ReadClose
 		return nil, err
 	}
 	return enc.DecryptReader(archivePath)
+}
+
+// closeArchiveStream closes the archive stream and folds its verdict into
+// readErr. For encrypted archives the Close error IS the decryption verdict
+// (the tool's exit status plus its stderr), so it must not stay hidden behind
+// the bare "EOF" that reading a stream the tool never filled produces.
+func closeArchiveStream(rc io.Closer, readErr error) error {
+	closeErr := rc.Close()
+	switch {
+	case closeErr == nil:
+		return readErr
+	case readErr == nil, maskedByDecryption(readErr):
+		return closeErr
+	default:
+		// a genuine archive problem: keep it, but do not drop the exit status
+		return fmt.Errorf("%w (closing archive stream: %w)", readErr, closeErr)
+	}
+}
+
+// maskedByDecryption reports whether err is the downstream symptom of a broken
+// decryption — an empty or garbage stream — rather than a real archive problem.
+func maskedByDecryption(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, gzip.ErrHeader) ||
+		errors.Is(err, gzip.ErrChecksum)
 }
 
 // ResolveAgeIdentity resolves identity files from a CLI override or config.
