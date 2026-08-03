@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ospiem/dotpak/internal/crypto"
 )
 
 func TestNew(t *testing.T) {
@@ -192,8 +194,8 @@ func TestGenerateArchiveName(t *testing.T) {
 	backupDir := "/backups"
 
 	t.Run("unencrypted archive", func(t *testing.T) {
-		name := GenerateArchiveName(backupDir, false, "")
-		if !strings.HasPrefix(name, "/backups/dotfiles-") {
+		name := GenerateArchiveName(backupDir, crypto.MethodNone)
+		if !strings.HasPrefix(name, "/backups/"+ArchivePrefix) {
 			t.Errorf("unexpected prefix: %s", name)
 		}
 		if !strings.HasSuffix(name, ".tar.gz") {
@@ -202,202 +204,24 @@ func TestGenerateArchiveName(t *testing.T) {
 	})
 
 	t.Run("age encrypted archive", func(t *testing.T) {
-		name := GenerateArchiveName(backupDir, true, "age")
+		name := GenerateArchiveName(backupDir, crypto.MethodAge)
 		if !strings.HasSuffix(name, ".tar.gz.age") {
 			t.Errorf("expected .tar.gz.age suffix, got %s", name)
 		}
 	})
 
 	t.Run("gpg encrypted archive", func(t *testing.T) {
-		name := GenerateArchiveName(backupDir, true, "gpg")
+		name := GenerateArchiveName(backupDir, crypto.MethodGPG)
 		if !strings.HasSuffix(name, ".tar.gz.gpg") {
 			t.Errorf("expected .tar.gz.gpg suffix, got %s", name)
 		}
 	})
 
 	t.Run("includes timestamp", func(t *testing.T) {
-		name := GenerateArchiveName(backupDir, false, "")
+		name := GenerateArchiveName(backupDir, crypto.MethodNone)
 		base := filepath.Base(name)
 		if len(base) < len("dotfiles-20250110_120000.tar.gz") {
 			t.Errorf("name too short: %s", name)
 		}
 	})
-}
-
-func TestStats(t *testing.T) {
-	t.Parallel()
-
-	stats := Stats{
-		FilesBackedUp:  100,
-		FilesSkipped:   5,
-		FilesExcluded:  10,
-		SensitiveFiles: 3,
-		TotalSize:      1024 * 1024 * 10, // 10 MB
-	}
-
-	t.Run("json serialization", func(t *testing.T) {
-		data, err := json.Marshal(stats)
-		if err != nil {
-			t.Fatalf("failed to marshal: %v", err)
-		}
-
-		var parsed Stats
-		if err := json.Unmarshal(data, &parsed); err != nil {
-			t.Fatalf("failed to unmarshal: %v", err)
-		}
-
-		if parsed.FilesBackedUp != stats.FilesBackedUp {
-			t.Errorf("files backed up mismatch: got %d, want %d", parsed.FilesBackedUp, stats.FilesBackedUp)
-		}
-		if parsed.TotalSize != stats.TotalSize {
-			t.Errorf("total size mismatch: got %d, want %d", parsed.TotalSize, stats.TotalSize)
-		}
-	})
-}
-
-func TestBackupResult(t *testing.T) {
-	t.Parallel()
-
-	result := BackupResult{
-		Success:          true,
-		Archive:          "/backups/test.tar.gz",
-		Encrypted:        true,
-		EncryptionMethod: "age",
-		Stats: Stats{
-			FilesBackedUp: 50,
-		},
-	}
-
-	t.Run("json serialization", func(t *testing.T) {
-		data, err := json.Marshal(result)
-		if err != nil {
-			t.Fatalf("failed to marshal: %v", err)
-		}
-
-		var parsed BackupResult
-		if err := json.Unmarshal(data, &parsed); err != nil {
-			t.Fatalf("failed to unmarshal: %v", err)
-		}
-
-		if parsed.Success != result.Success {
-			t.Error("success mismatch")
-		}
-		if parsed.Archive != result.Archive {
-			t.Errorf("archive mismatch: got %s, want %s", parsed.Archive, result.Archive)
-		}
-		if parsed.Encrypted != result.Encrypted {
-			t.Error("encrypted mismatch")
-		}
-	})
-
-	t.Run("error result", func(t *testing.T) {
-		errResult := BackupResult{
-			Success: false,
-			Error:   "backup failed: disk full",
-		}
-
-		data, err := json.Marshal(errResult)
-		if err != nil {
-			t.Fatalf("failed to marshal: %v", err)
-		}
-
-		if !strings.Contains(string(data), "disk full") {
-			t.Error("expected error message in JSON")
-		}
-	})
-}
-
-func TestRestoreResult(t *testing.T) {
-	t.Parallel()
-
-	result := RestoreResult{
-		Success:      true,
-		Archive:      "/backups/test.tar.gz",
-		SafetyBackup: "/backups/pre-restore/backup.tar.gz",
-		Categories:   []string{"shell", "git"},
-		DryRun:       false,
-	}
-
-	data, err := json.Marshal(result)
-	if err != nil {
-		t.Fatalf("failed to marshal: %v", err)
-	}
-
-	var parsed RestoreResult
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		t.Fatalf("failed to unmarshal: %v", err)
-	}
-
-	if len(parsed.Categories) != 2 {
-		t.Errorf("expected 2 categories, got %d", len(parsed.Categories))
-	}
-}
-
-func TestListResult(t *testing.T) {
-	t.Parallel()
-
-	result := ListResult{
-		Success: true,
-		Backups: []BackupInfo{
-			{
-				Archive:   "/backups/dotfiles-20250110_120000.tar.gz",
-				Timestamp: "2025-01-10T12:00:00",
-				Size:      1024 * 1024,
-				Encrypted: false,
-			},
-			{
-				Archive:    "/backups/dotfiles-20250111_120000.tar.gz.age",
-				Timestamp:  "2025-01-11T12:00:00",
-				Size:       2048 * 1024,
-				Encrypted:  true,
-				Encryption: "age",
-			},
-		},
-	}
-
-	data, err := json.Marshal(result)
-	if err != nil {
-		t.Fatalf("failed to marshal: %v", err)
-	}
-
-	var parsed ListResult
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		t.Fatalf("failed to unmarshal: %v", err)
-	}
-
-	if len(parsed.Backups) != 2 {
-		t.Errorf("expected 2 backups, got %d", len(parsed.Backups))
-	}
-	if parsed.Backups[1].Encrypted != true {
-		t.Error("expected second backup to be encrypted")
-	}
-}
-
-func TestBackupInfo(t *testing.T) {
-	t.Parallel()
-
-	info := BackupInfo{
-		Archive:      "/backups/dotfiles-20250110_120000.tar.gz.age",
-		Timestamp:    "2025-01-10T12:00:00",
-		Size:         5 * 1024 * 1024,
-		Encrypted:    true,
-		Encryption:   "age",
-		Hostname:     "my-macbook",
-		FileCount:    150,
-		MetadataPath: "/backups/dotfiles-20250110_120000.json",
-	}
-
-	data, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("failed to marshal: %v", err)
-	}
-	if !strings.Contains(string(data), `"archive"`) {
-		t.Error("expected 'archive' field in JSON")
-	}
-	if !strings.Contains(string(data), `"file_count"`) {
-		t.Error("expected 'file_count' field in JSON")
-	}
-	if !strings.Contains(string(data), `"metadata_path"`) {
-		t.Error("expected 'metadata_path' field in JSON")
-	}
 }

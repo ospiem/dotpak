@@ -3,6 +3,7 @@ package restore
 import (
 	"archive/tar"
 	"compress/gzip"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -93,7 +94,10 @@ func TestNew(t *testing.T) {
 	opts := &Options{}
 	out := output.New(output.ModeQuiet, false)
 
-	r := New(cfg, opts, out)
+	r, err := New(cfg, opts, out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if r == nil {
 		t.Fatal("expected non-nil restore instance")
@@ -116,13 +120,28 @@ func TestCategories(t *testing.T) {
 		expectedCategories := []string{
 			"shell", "git", "editor", "ssh", "gpg",
 			"python", "node", "rust", "go", "cloud",
-			"docker", "terminal", "desktop",
+			"docker", "terminal", "desktop", "ai",
 		}
 
 		for _, cat := range expectedCategories {
 			if _, ok := Categories[cat]; !ok {
 				t.Errorf("expected category %s to be defined", cat)
 			}
+		}
+		// force this list to be updated when a category is added
+		if len(Categories) != len(expectedCategories) {
+			t.Errorf("Categories has %d entries, test expects %d — update expectedCategories",
+				len(Categories), len(expectedCategories))
+		}
+	})
+
+	t.Run("CategoryNames is sorted and complete", func(t *testing.T) {
+		names := CategoryNames()
+		if len(names) != len(Categories) {
+			t.Errorf("expected %d names, got %d", len(Categories), len(names))
+		}
+		if !slices.IsSorted(names) {
+			t.Errorf("expected sorted names, got %v", names)
 		}
 	})
 
@@ -213,7 +232,7 @@ func TestIsSafePath(t *testing.T) {
 		{"double dots in middle", "foo/bar/../baz", false},
 		{"absolute path", "/etc/passwd", false},
 		{"home tilde", "~/.zshrc", false},
-		{"empty path", "", true},
+		{"empty path", "", false},
 		{"just dots", "...", false},
 		{"single dot", ".", true},
 	}
@@ -455,53 +474,18 @@ func TestExtractFile(t *testing.T) {
 	})
 }
 
-func TestFormatSize(t *testing.T) {
+func TestValidateCategories(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		size     int64
-		expected string
-	}{
-		{0, "0 bytes"},
-		{100, "100 bytes"},
-		{1023, "1023 bytes"},
-		{1024, "1.00 KB"},
-		{1536, "1.50 KB"},
-		{1024 * 1024, "1.00 MB"},
-		{1024 * 1024 * 1024, "1.00 GB"},
+	if err := validateCategories([]string{"shell", "git"}); err != nil {
+		t.Errorf("unexpected error for known categories: %v", err)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.expected, func(t *testing.T) {
-			result := formatSize(tt.size)
-			if result != tt.expected {
-				t.Errorf("formatSize(%d) = %s, want %s", tt.size, result, tt.expected)
-			}
-		})
+	if err := validateCategories(nil); err != nil {
+		t.Errorf("unexpected error for empty categories: %v", err)
 	}
-}
-
-func TestOptions(t *testing.T) {
-	t.Parallel()
-
-	opts := &Options{
-		DryRun:     true,
-		Force:      true,
-		Categories: []string{"shell", "git"},
-		NoBackup:   true,
-	}
-
-	if !opts.DryRun {
-		t.Error("expected DryRun to be true")
-	}
-	if !opts.Force {
-		t.Error("expected Force to be true")
-	}
-	if len(opts.Categories) != 2 {
-		t.Errorf("expected 2 categories, got %d", len(opts.Categories))
-	}
-	if !opts.NoBackup {
-		t.Error("expected NoBackup to be true")
+	// a typo must be an error, not a silent 0-file restore
+	if err := validateCategories([]string{"shel"}); err == nil {
+		t.Error("expected error for unknown category")
 	}
 }
 
@@ -532,7 +516,7 @@ func TestCreateSafetyBackup(t *testing.T) {
 			out:     output.New(output.ModeQuiet, false),
 		}
 
-		safetyPath, err := r.createSafetyBackup(archivePath, archivePath)
+		safetyPath, err := r.createSafetyBackup(archivePath)
 		if err != nil {
 			t.Fatalf("createSafetyBackup failed: %v", err)
 		}
@@ -545,17 +529,26 @@ func TestCreateSafetyBackup(t *testing.T) {
 			t.Errorf("safety backup should exist: %v", err)
 		}
 
-		f, _ := os.Open(safetyPath)
+		f, err := os.Open(safetyPath)
+		if err != nil {
+			t.Fatalf("opening safety backup: %v", err)
+		}
 		defer f.Close()
-		gzr, _ := gzip.NewReader(f)
+		gzr, err := gzip.NewReader(f)
+		if err != nil {
+			t.Fatalf("reading safety backup: %v", err)
+		}
 		defer gzr.Close()
 		tr := tar.NewReader(gzr)
 
 		found := false
 		for {
 			header, err := tr.Next()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
+			}
+			if err != nil {
+				t.Fatalf("reading safety backup tar: %v", err)
 			}
 			if header.Name == ".zshrc" {
 				found = true
@@ -589,7 +582,7 @@ func TestCreateSafetyBackup(t *testing.T) {
 			out:     output.New(output.ModeQuiet, true),
 		}
 
-		safetyPath, err := r.createSafetyBackup(archivePath, archivePath)
+		safetyPath, err := r.createSafetyBackup(archivePath)
 		if err != nil {
 			t.Fatalf("createSafetyBackup failed: %v", err)
 		}
@@ -599,26 +592,61 @@ func TestCreateSafetyBackup(t *testing.T) {
 		}
 	})
 
-	t.Run("encrypts safety backup when original was encrypted", func(t *testing.T) {
-		// create fresh setup for this test
+	t.Run("aborts instead of writing sensitive plaintext in non-interactive mode", func(t *testing.T) {
 		freshSetup := setupTest(t)
 
-		existingFile := filepath.Join(freshSetup.homeDir, ".zshrc")
-		createTestFile(t, existingFile, "original content")
+		createTestFile(t, filepath.Join(freshSetup.homeDir, ".ssh", "id_ed25519"), "PRIVATE KEY")
+
+		archivePath := filepath.Join(freshSetup.backupDir, "source.tar.gz")
+		createTestArchive(t, archivePath, map[string]string{
+			".ssh/id_ed25519": "new key",
+		})
+
+		cfg := &config.Config{
+			Backup: config.BackupConfig{
+				BackupDir: freshSetup.backupDir,
+				// no encryption configured
+			},
+		}
+
+		r := &Restore{
+			cfg:     cfg,
+			homeDir: freshSetup.homeDir,
+			opts:    &Options{},
+			out:     output.New(output.ModeQuiet, false), // non-interactive
+		}
+
+		if _, err := r.createSafetyBackup(archivePath); err == nil {
+			t.Fatal("expected error: sensitive files must never be silently written unencrypted")
+		}
+
+		// nothing may have been written to the pre-restore dir
+		matches, _ := filepath.Glob(filepath.Join(freshSetup.backupDir, "pre-restore", "*"))
+		if len(matches) != 0 {
+			t.Errorf("expected no safety archive on abort, found %v", matches)
+		}
+	})
+
+	t.Run("aborts when a file for the safety backup is unreadable", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skip("running as root, permission checks are bypassed")
+		}
+		freshSetup := setupTest(t)
+
+		unreadable := filepath.Join(freshSetup.homeDir, ".zshrc")
+		createTestFile(t, unreadable, "cannot read me")
+		if err := os.Chmod(unreadable, 0000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(unreadable, 0644) })
 
 		archivePath := filepath.Join(freshSetup.backupDir, "source.tar.gz")
 		createTestArchive(t, archivePath, map[string]string{
 			".zshrc": "new content",
 		})
 
-		// simulate encrypted original archive path (just using .age extension)
-		originalArchivePath := archivePath + ".age"
-
 		cfg := &config.Config{
-			Backup: config.BackupConfig{
-				BackupDir: freshSetup.backupDir,
-				// note: no recipients file, so encryption will fail gracefully
-			},
+			Backup: config.BackupConfig{BackupDir: freshSetup.backupDir},
 		}
 
 		r := &Restore{
@@ -628,21 +656,130 @@ func TestCreateSafetyBackup(t *testing.T) {
 			out:     output.New(output.ModeQuiet, false),
 		}
 
-		// this will attempt encryption but fall back to unencrypted since no recipients
-		safetyPath, err := r.createSafetyBackup(archivePath, originalArchivePath)
-		if err != nil {
-			t.Fatalf("createSafetyBackup failed: %v", err)
-		}
-
-		if safetyPath == "" {
-			t.Fatal("expected safety backup path")
-		}
-
-		// should fall back to .tar.gz since no recipients configured
-		if _, err := os.Stat(safetyPath); err != nil {
-			t.Errorf("safety backup should exist: %v", err)
+		if _, err := r.createSafetyBackup(archivePath); err == nil {
+			t.Fatal("expected error: safety backup may hold the only copy and must not skip files silently")
 		}
 	})
+}
+
+func TestExtractFile_ReplacesSymlinkInsteadOfFollowing(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	realFile := filepath.Join(tmpDir, "real.txt")
+	if err := os.WriteFile(realFile, []byte("original"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := filepath.Join(tmpDir, "link")
+	if err := os.Symlink(realFile, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := extractFile(strings.NewReader("restored"), linkPath, 0644, 1024); err != nil {
+		t.Fatalf("extractFile failed: %v", err)
+	}
+
+	// the symlink target must be untouched
+	content, err := os.ReadFile(realFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "original" {
+		t.Errorf("write followed the symlink: real file now contains %q", content)
+	}
+
+	// the link itself must have been replaced by a regular file
+	info, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Error("expected symlink to be replaced by a regular file")
+	}
+	linkContent, _ := os.ReadFile(linkPath)
+	if string(linkContent) != "restored" {
+		t.Errorf("unexpected extracted content: %q", linkContent)
+	}
+}
+
+func TestExtractStream_BlocksEscapeThroughSymlinkedDir(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	homeDir := filepath.Join(tmpDir, "home")
+	outsideDir := filepath.Join(tmpDir, "outside")
+	backupDir := filepath.Join(tmpDir, "backups")
+	for _, d := range []string{homeDir, outsideDir, backupDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// pre-existing symlink inside home pointing outside of it
+	if err := os.Symlink(outsideDir, filepath.Join(homeDir, "work")); err != nil {
+		t.Fatal(err)
+	}
+
+	archivePath := filepath.Join(backupDir, "evil.tar.gz")
+	createTestArchive(t, archivePath, map[string]string{
+		"work/hook.sh": "malicious",
+	})
+
+	r := &Restore{
+		cfg:     &config.Config{Backup: config.BackupConfig{BackupDir: backupDir}},
+		homeDir: homeDir,
+		opts:    &Options{},
+		out:     output.New(output.ModeQuiet, false),
+	}
+
+	count, err := r.extractArchive(archivePath)
+	if err != nil {
+		t.Fatalf("extractArchive failed: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 files extracted, got %d", count)
+	}
+
+	if _, err := os.Stat(filepath.Join(outsideDir, "hook.sh")); !os.IsNotExist(err) {
+		t.Errorf("file was written outside the home directory (stat err: %v)", err)
+	}
+}
+
+func TestExtractStream_CreatesPrivateParentDirs(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	homeDir := filepath.Join(tmpDir, "home")
+	backupDir := filepath.Join(tmpDir, "backups")
+	for _, d := range []string{homeDir, backupDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	archivePath := filepath.Join(backupDir, "ssh.tar.gz")
+	createTestArchive(t, archivePath, map[string]string{
+		".ssh/authorized_keys": "ssh-ed25519 AAAA...",
+	})
+
+	r := &Restore{
+		cfg:     &config.Config{Backup: config.BackupConfig{BackupDir: backupDir}},
+		homeDir: homeDir,
+		opts:    &Options{},
+		out:     output.New(output.ModeQuiet, false),
+	}
+
+	if _, err := r.extractArchive(archivePath); err != nil {
+		t.Fatalf("extractArchive failed: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(homeDir, ".ssh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0700 {
+		t.Errorf("expected restored ~/.ssh to be 0700, got %o", info.Mode().Perm())
+	}
 }
 
 func TestListArchiveContents(t *testing.T) {

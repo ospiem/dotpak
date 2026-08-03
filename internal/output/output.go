@@ -47,20 +47,18 @@ func (o *Output) SetErrWriter(w io.Writer) {
 	o.errWriter = w
 }
 
+// Mode returns the output mode. Callers use it to decide whether interactive
+// prompts are possible.
+func (o *Output) Mode() Mode {
+	return o.mode
+}
+
 // Print outputs a message in normal mode.
 func (o *Output) Print(format string, args ...any) {
 	if o.mode == ModeQuiet || o.mode == ModeJSON {
 		return
 	}
 	fmt.Fprintf(o.writer, format, args...)
-}
-
-// Println outputs a message with newline in normal mode.
-func (o *Output) Println(args ...any) {
-	if o.mode == ModeQuiet || o.mode == ModeJSON {
-		return
-	}
-	fmt.Fprintln(o.writer, args...)
 }
 
 // Verbose outputs only when verbose mode is enabled.
@@ -79,12 +77,10 @@ func (o *Output) Error(format string, args ...any) {
 	color.New(color.FgRed).Fprintf(o.errWriter, "Error: "+format, args...)
 }
 
-// Warning outputs a warning message.
+// Warning outputs a warning to stderr. Warnings signal degraded behavior, so
+// they stay visible in quiet and JSON modes; stderr never corrupts JSON stdout.
 func (o *Output) Warning(format string, args ...any) {
-	if o.mode == ModeQuiet || o.mode == ModeJSON {
-		return
-	}
-	color.New(color.FgYellow).Fprintf(o.writer, "Warning: "+format, args...)
+	color.New(color.FgYellow).Fprintf(o.errWriter, "Warning: "+format, args...)
 }
 
 // Success outputs a success message.
@@ -95,20 +91,15 @@ func (o *Output) Success(format string, args ...any) {
 	color.New(color.FgGreen).Fprintf(o.writer, format, args...)
 }
 
-// Info outputs an info message.
-func (o *Output) Info(format string, args ...any) {
-	if o.mode == ModeQuiet || o.mode == ModeJSON {
-		return
-	}
-	color.New(color.FgCyan).Fprintf(o.writer, format, args...)
-}
+// progressItemWidth limits how much of the current item name the progress line shows.
+const progressItemWidth = 60
 
 // Progress outputs progress information.
 func (o *Output) Progress(current, total int, item string) {
 	if o.mode == ModeQuiet || o.mode == ModeJSON {
 		return
 	}
-	fmt.Fprintf(o.writer, "\r[%d/%d] %s", current, total, truncate(item, 60))
+	fmt.Fprintf(o.writer, "\r[%d/%d] %s", current, total, truncate(item, progressItemWidth))
 }
 
 // ClearProgress clears the progress line.
@@ -127,14 +118,6 @@ func (o *Output) JSON(data any) error {
 	encoder := json.NewEncoder(o.writer)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(data)
-}
-
-// JSONCompact outputs data as compact JSON.
-func (o *Output) JSONCompact(data any) error {
-	if o.mode != ModeJSON {
-		return nil
-	}
-	return json.NewEncoder(o.writer).Encode(data)
 }
 
 // DiffOutput handles diff-specific output with colors.

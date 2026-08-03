@@ -54,12 +54,14 @@ GPG also supported: `dotpak backup --encrypt gpg --gpg-recipient you@email.com`
 
 ### Encrypted identity files (YubiKey)
 
-If your age identity is encrypted (e.g. with `age-plugin-yubikey`), use `--age-identity` to pipe the decrypted key:
+If your age identity is encrypted (e.g. with `age-plugin-yubikey`), use `--age-identity` to pipe the decrypted key.
+With `-` the identity is read from stdin, so `restore` needs `--force` (or `--dry-run`) — otherwise the confirmation
+prompt would consume the piped key instead of your answer:
 
 ```bash
 # Decrypt identity via YubiKey, pipe to dotpak
 age -d -i ~/.config/age/yubikey-identity encrypted-key.age | dotpak diff --age-identity - archive.tar.gz.age
-age -d -i ~/.config/age/yubikey-identity encrypted-key.age | dotpak restore --age-identity - archive.tar.gz.age
+age -d -i ~/.config/age/yubikey-identity encrypted-key.age | dotpak restore --age-identity - --force archive.tar.gz.age
 age -d -i ~/.config/age/yubikey-identity encrypted-key.age | dotpak contents --age-identity -  archive.tar.gz.age
 
 # Or pass a plaintext identity file directly

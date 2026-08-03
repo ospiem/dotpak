@@ -2,13 +2,10 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -19,10 +16,13 @@ import (
 
 	"github.com/ospiem/dotpak/internal/backup"
 	"github.com/ospiem/dotpak/internal/config"
+	"github.com/ospiem/dotpak/internal/crypto"
 	"github.com/ospiem/dotpak/internal/metadata"
 	"github.com/ospiem/dotpak/internal/osutils"
 	"github.com/ospiem/dotpak/internal/output"
+	"github.com/ospiem/dotpak/internal/pkgrestore"
 	"github.com/ospiem/dotpak/internal/restore"
+	"github.com/ospiem/dotpak/internal/schedule"
 )
 
 // Build information. Populated at build time via -ldflags.
@@ -58,6 +58,9 @@ Examples:
   dotpak restore                    # Restore from latest backup
   dotpak restore backup.tar.gz.age  # Restore specific archive
   dotpak list                       # List available backups`,
+		// errors are reported exactly once via outputError / the JSON envelope
+		SilenceErrors: true,
+		SilenceUsage:  true,
 	}
 
 	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "", "Config file path")
@@ -127,20 +130,19 @@ Examples:
 				opts.EncryptionMethod = encrypt
 			}
 
-			b := backup.New(cfg, opts, out)
-			result, err := b.Run()
+			b, err := backup.New(cfg, opts, out)
 			if err != nil {
 				return outputError(out, err)
 			}
 
+			result, runErr := b.Run()
 			if jsonOutput {
 				_ = out.JSON(result)
+				return runErr // the JSON envelope already carries the error
 			}
-
-			if !result.Success {
-				return errors.New(result.Error)
+			if runErr != nil {
+				return outputError(out, runErr)
 			}
-
 			return nil
 		},
 	}
@@ -184,7 +186,7 @@ Examples:
   dotpak restore --homebrew             # Homebrew packages only
   dotpak restore --go                   # Go packages only
 
-Categories: shell, git, editor, ssh, gpg, python, node, rust, go, cloud, docker, terminal, desktop`,
+Categories: ` + strings.Join(restore.CategoryNames(), ", "),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			out := getOutput()
@@ -195,15 +197,15 @@ Categories: shell, git, editor, ssh, gpg, python, node, rust, go, cloud, docker,
 			}
 
 			if homebrew {
-				return handleHomebrew(cfg.Backup.BackupDir, dryRun, out)
+				return outputWrap(out, pkgrestore.Homebrew(cfg.Backup.BackupDir, dryRun, out))
 			}
 
 			if apt {
-				return handleApt(cfg.Backup.BackupDir, dryRun, out)
+				return outputWrap(out, pkgrestore.Apt(cfg.Backup.BackupDir, dryRun, out))
 			}
 
 			if goRestore {
-				return handleGo(cfg.Backup.BackupDir, dryRun, out)
+				return outputWrap(out, pkgrestore.Go(cfg.Backup.BackupDir, dryRun, out))
 			}
 
 			var archivePath string
@@ -225,7 +227,26 @@ Categories: shell, git, editor, ssh, gpg, python, node, rust, go, cloud, docker,
 				}
 			}
 
-			if !force && !dryRun && !jsonOutput {
+			if !force && !dryRun {
+				// the identity arrives on stdin, so the prompt would read the
+				// key instead of the answer (and corrupt the identity)
+				if ageIdentity == "-" {
+					identityErr := errors.New(
+						"--age-identity - reads stdin, leaving no input for the confirmation prompt; " +
+							"pass --force (or --dry-run)",
+					)
+					return outputError(out, identityErr)
+				}
+
+				// non-interactive modes cannot show the prompt; require an
+				// explicit --force instead of silently overwriting files
+				if jsonOutput || quiet {
+					confirmErr := errors.New(
+						"restore overwrites existing files; pass --force (or --dry-run) with --json/--quiet",
+					)
+					return outputError(out, confirmErr)
+				}
+
 				out.Print("\nRestore from: %s\n", filepath.Base(archivePath))
 				if len(categories) > 0 {
 					out.Print("Categories: %s\n", strings.Join(categories, ", "))
@@ -248,20 +269,19 @@ Categories: shell, git, editor, ssh, gpg, python, node, rust, go, cloud, docker,
 				AgeIdentity: ageIdentity,
 			}
 
-			r := restore.New(cfg, opts, out)
-			result, err := r.Run(archivePath)
+			r, err := restore.New(cfg, opts, out)
 			if err != nil {
 				return outputError(out, err)
 			}
 
+			result, runErr := r.Run(archivePath)
 			if jsonOutput {
 				_ = out.JSON(result)
+				return runErr // the JSON envelope already carries the error
 			}
-
-			if !result.Success {
-				return errors.New(result.Error)
+			if runErr != nil {
+				return outputError(out, runErr)
 			}
-
 			return nil
 		},
 	}
@@ -315,7 +335,7 @@ func listCmd() *cobra.Command {
 					Archive:   fullPath,
 					Timestamp: extractTimestamp(name),
 					Size:      info.Size(),
-					Encrypted: hasEncryptionExt(name),
+					Encrypted: crypto.IsEncryptedPath(name),
 				}
 
 				metaPath := metadata.GetMetadataPath(fullPath)
@@ -351,7 +371,7 @@ func listCmd() *cobra.Command {
 						enc = fmt.Sprintf(" [%s]", b.Encryption)
 					}
 					out.Print("  %s%s\n", filepath.Base(b.Archive), enc)
-					out.Print("    Size: %s, Files: %d\n", formatSize(b.Size), b.FileCount)
+					out.Print("    Size: %s, Files: %d\n", osutils.FormatSize(b.Size), b.FileCount)
 					if b.Hostname != "" {
 						out.Print("    Host: %s\n", b.Hostname)
 					}
@@ -389,7 +409,7 @@ func configInitCmd() *cobra.Command {
 			}
 
 			dir := filepath.Dir(cfgPath)
-			if err := os.MkdirAll(dir, 0755); err != nil {
+			if err := os.MkdirAll(dir, 0700); err != nil {
 				return outputError(out, fmt.Errorf("creating config directory: %w", err))
 			}
 
@@ -434,7 +454,7 @@ func configValidateCmd() *cobra.Command {
 				return outputError(out, err)
 			}
 
-			if err = validateConfig(cfg); err != nil {
+			if err = config.Validate(cfg); err != nil {
 				return outputError(out, err)
 			}
 
@@ -457,7 +477,7 @@ func diffCmd() *cobra.Command {
 			if err != nil {
 				return outputError(out, err)
 			}
-			return restore.ShowDiff(cfg, args[0], ageIdentity, verbose, out)
+			return outputWrap(out, restore.ShowDiff(cfg, args[0], ageIdentity, verbose, out))
 		},
 	}
 
@@ -479,7 +499,7 @@ func contentsCmd() *cobra.Command {
 			if err != nil {
 				return outputError(out, err)
 			}
-			return restore.ListArchiveContents(cfg, args[0], ageIdentity, out)
+			return outputWrap(out, restore.ListArchiveContents(cfg, args[0], ageIdentity, out))
 		},
 	}
 
@@ -504,7 +524,7 @@ func cronCmd() *cobra.Command {
 			if cronHour < 0 || cronHour > 23 {
 				return outputError(out, fmt.Errorf("hour must be between 0 and 23, got %d", cronHour))
 			}
-			return installCron(cronHour, out)
+			return outputWrap(out, schedule.Install(cronHour, configFile, out))
 		},
 	}
 	installCmd.Flags().IntVar(&cronHour, "hour", 15, "Hour for daily backup (0-23)")
@@ -514,7 +534,7 @@ func cronCmd() *cobra.Command {
 		Short: "Remove daily backup schedule",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			out := getOutput()
-			return uninstallCron(out)
+			return outputWrap(out, schedule.Uninstall(out))
 		},
 	}
 
@@ -522,7 +542,10 @@ func cronCmd() *cobra.Command {
 		Use:   "status",
 		Short: "Show scheduled backup status",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return cronStatus(getOutput())
+			out := getOutput()
+			// nil config only degrades the FDA check in the status display
+			cfg, _ := loadConfig("")
+			return outputWrap(out, schedule.Status(cfg, out))
 		},
 	}
 
@@ -571,6 +594,8 @@ func loadConfig(profile string) (*config.Config, error) {
 	return config.LoadWithProfile(cfgPath, profile)
 }
 
+// outputError reports err to the user exactly once (cobra's own error
+// printing is silenced) and returns it for the exit code.
 func outputError(out *output.Output, err error) error {
 	if jsonOutput {
 		_ = out.JSON(map[string]any{
@@ -583,248 +608,16 @@ func outputError(out *output.Output, err error) error {
 	return err
 }
 
-func validateConfig(cfg *config.Config) error {
-	var issues []string
-
-	backupDir := strings.TrimSpace(cfg.Backup.BackupDir)
-	if backupDir == "" {
-		issues = append(issues, "backup.backup_dir is required")
-	} else {
-		expanded := backupDir
-		if strings.HasPrefix(expanded, "~/") {
-			if home, err := osutils.HomeDir(); err == nil {
-				expanded = filepath.Join(home, expanded[2:])
-			}
-		}
-		parentDir := filepath.Dir(expanded)
-		if info, err := os.Stat(parentDir); err != nil {
-			if os.IsNotExist(err) {
-				issues = append(issues, fmt.Sprintf("backup.backup_dir parent does not exist: %s", parentDir))
-			}
-		} else if !info.IsDir() {
-			issues = append(issues, fmt.Sprintf("backup.backup_dir parent is not a directory: %s", parentDir))
-		}
-	}
-
-	if cfg.Backup.MaxBackups < 0 {
-		issues = append(issues, "backup.max_backups must be >= 0")
-	}
-
-	switch cfg.Backup.Encryption {
-	case "age", "gpg", "none", "":
-	default:
-		issues = append(
-			issues,
-			fmt.Sprintf("backup.encryption must be age|gpg|none (got %q)", cfg.Backup.Encryption),
-		)
-	}
-
-	if cfg.Backup.Encryption == "age" {
-		if strings.TrimSpace(cfg.Backup.AgeRecipients) == "" {
-			issues = append(issues, "backup.age_recipients is required when encryption=age")
-		} else {
-			recipientsPath := cfg.Backup.AgeRecipients
-			if strings.HasPrefix(recipientsPath, "~/") {
-				if home, err := osutils.HomeDir(); err == nil {
-					recipientsPath = filepath.Join(home, recipientsPath[2:])
-				}
-			}
-			if _, err := os.Stat(recipientsPath); err != nil {
-				issues = append(issues, fmt.Sprintf("backup.age_recipients not found: %s", cfg.Backup.AgeRecipients))
-			}
-		}
-	}
-
-	if cfg.Backup.Encryption == "gpg" && strings.TrimSpace(cfg.Backup.GPGRecipient) == "" {
-		issues = append(issues, "backup.gpg_recipient is required when encryption=gpg")
-	}
-
-	for _, path := range cfg.Items {
-		if strings.TrimSpace(path) == "" {
-			issues = append(issues, "items contains empty path")
-			break
-		}
-	}
-
-	for _, path := range cfg.Sensitive {
-		if strings.TrimSpace(path) == "" {
-			issues = append(issues, "sensitive contains empty path")
-			break
-		}
-	}
-
-	if len(issues) == 0 {
+// outputWrap passes nil through and reports non-nil errors via outputError.
+func outputWrap(out *output.Output, err error) error {
+	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("config validation failed:\n- %s", strings.Join(issues, "\n- "))
-}
-
-func handleHomebrew(backupDir string, dryRun bool, out *output.Output) error {
-	// sanitize and validate the brewfile path
-	cleanBackupDir := filepath.Clean(backupDir)
-	brewfile := filepath.Join(cleanBackupDir, "Brewfile")
-
-	// resolve to absolute path and verify it's within backup directory
-	absBrewfile, err := filepath.Abs(brewfile)
-	if err != nil {
-		return outputError(out, fmt.Errorf("invalid brewfile path: %w", err))
-	}
-	absBackupDir, err := filepath.Abs(cleanBackupDir)
-	if err != nil {
-		return outputError(out, fmt.Errorf("invalid backup directory: %w", err))
-	}
-	if !strings.HasPrefix(absBrewfile, absBackupDir+string(filepath.Separator)) {
-		return outputError(out, errors.New("brewfile path escapes backup directory"))
-	}
-
-	// verify it's a regular file (not a symlink to outside)
-	info, err := os.Lstat(absBrewfile)
-	if err != nil {
-		return outputError(out, fmt.Errorf("brewfile not found: %s", brewfile))
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return outputError(out, errors.New("brewfile cannot be a symlink"))
-	}
-
-	out.Print("Restoring Homebrew packages from %s...\n", brewfile)
-
-	if dryRun {
-		out.Print("\nDry run - would run: brew bundle install --file=%s\n", brewfile)
-		return nil
-	}
-
-	//nolint:gosec // g204: absBrewfile is validated to be within backup directory above
-	cmd := exec.Command("brew", "bundle", "install", "--file="+absBrewfile, "--no-lock")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err = cmd.Run(); err != nil {
-		return outputError(out, fmt.Errorf("brew bundle failed: %w", err))
-	}
-
-	out.Success("Homebrew packages restored\n")
-	return nil
-}
-
-const linux = "linux"
-const darwin = "darwin"
-
-func handleApt(backupDir string, dryRun bool, out *output.Output) error {
-	if runtime.GOOS != linux {
-		return outputError(out, errors.New("apt restore only available on Linux"))
-	}
-	aptFile := filepath.Join(filepath.Clean(backupDir), "apt-packages.txt")
-	if _, err := os.Stat(aptFile); err != nil {
-		return outputError(out, errors.New("apt-packages.txt not found in backup"))
-	}
-	if dryRun {
-		out.Print("Dry run - would install packages from: %s\n", aptFile)
-		return nil
-	}
-	out.Print("To restore apt packages, run:\n")
-	out.Print("  xargs sudo apt install -y < %s\n", aptFile)
-	return nil
-}
-
-func handleGo(backupDir string, dryRun bool, out *output.Output) error {
-	goFile := filepath.Join(filepath.Clean(backupDir), "go-packages.txt")
-	content, err := os.ReadFile(goFile)
-	if err != nil {
-		return outputError(out, errors.New("go-packages.txt not found in backup"))
-	}
-
-	var packages []string
-	for line := range strings.SplitSeq(string(content), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			packages = append(packages, line)
-		}
-	}
-
-	if len(packages) == 0 {
-		out.Print("No Go packages to restore\n")
-		return nil
-	}
-
-	out.Print("Restoring %d Go packages...\n", len(packages))
-
-	if dryRun {
-		out.Print("\nDry run - would run:\n")
-		for _, pkg := range packages {
-			out.Print("  go install %s@latest\n", pkg)
-		}
-		return nil
-	}
-
-	var installed, failed int
-	for _, pkg := range packages {
-		out.Verbose("Installing %s...\n", pkg)
-		//nolint:gosec // g204: pkg comes from go-packages.txt backup file created by this tool
-		cmd := exec.Command("go", "install", pkg+"@latest")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err = cmd.Run(); err != nil {
-			out.Warning("Failed to install %s: %v\n", pkg, err)
-			failed++
-		} else {
-			installed++
-		}
-	}
-
-	if failed > 0 {
-		out.Print("Go packages: %d installed, %d failed\n", installed, failed)
-	} else {
-		out.Success("Installed %d Go packages\n", installed)
-	}
-	return nil
-}
-
-func installCron(hour int, out *output.Output) error {
-	switch runtime.GOOS {
-	case darwin:
-		return installLaunchdCron(hour, out)
-	case linux:
-		return installLinuxCron(hour, out)
-	default:
-		return outputError(out, errors.New("cron install is supported on macOS and Linux only"))
-	}
-}
-
-func uninstallCron(out *output.Output) error {
-	switch runtime.GOOS {
-	case darwin:
-		return uninstallLaunchdCron(out)
-	case linux:
-		return uninstallLinuxCron(out)
-	default:
-		return outputError(out, errors.New("cron uninstall is supported on macOS and Linux only"))
-	}
-}
-
-func cronStatus(out *output.Output) error {
-	switch runtime.GOOS {
-	case darwin:
-		return launchdStatus(out)
-	case linux:
-		return linuxCronStatus(out)
-	default:
-		return outputError(out, errors.New("cron status is supported on macOS and Linux only"))
-	}
-}
-
-func cronLogPath() (string, error) {
-	home, err := osutils.HomeDir()
-	if err != nil {
-		return "", err
-	}
-	if runtime.GOOS == darwin {
-		return filepath.Join(home, "Library", "Logs", "dotpak", "backup.log"), nil
-	}
-	return filepath.Join(home, ".local", "share", "dotpak", "backup.log"), nil
+	return outputError(out, err)
 }
 
 func cronRun() error {
-	logPath, err := cronLogPath()
+	logPath, err := schedule.LogPath()
 	if err != nil {
 		return err
 	}
@@ -849,429 +642,22 @@ func cronRun() error {
 
 	out := output.New(output.ModeQuiet, false)
 
-	b := backup.New(cfg, &backup.Options{IncludeSecrets: true}, out)
-	result, err := b.Run()
+	b, err := backup.New(cfg, &backup.Options{IncludeSecrets: true}, out)
 	if err != nil {
 		fmt.Fprintf(logFile, "error: %v\n", err)
 		return err
 	}
 
+	result, runErr := b.Run()
 	enc := json.NewEncoder(logFile)
 	enc.SetIndent("", "  ")
 	if encErr := enc.Encode(result); encErr != nil {
 		fmt.Fprintf(logFile, "error encoding result: %v\n", encErr)
 	}
-
-	if !result.Success {
-		return errors.New(result.Error)
+	if runErr != nil {
+		fmt.Fprintf(logFile, "error: %v\n", runErr)
 	}
-
-	return nil
-}
-
-func cronBackupArgs(execPath string) []string {
-	args := []string{execPath, "backup", "--json"}
-	if configFile != "" {
-		args = append(args, "--config", configFile)
-	}
-	return args
-}
-
-func installLaunchdCron(hour int, out *output.Output) error {
-	home, err := osutils.HomeDir()
-	if err != nil {
-		return outputError(out, err)
-	}
-	plistPath := filepath.Join(home, "Library", "LaunchAgents", "dev.ospiem.dotpak.plist")
-
-	execPath, err := os.Executable()
-	if err != nil {
-		return outputError(out, fmt.Errorf("getting executable path: %w", err))
-	}
-
-	// resolve symlinks - FDA needs the real binary path
-	resolvedPath, err := filepath.EvalSymlinks(execPath)
-	if err != nil {
-		resolvedPath = execPath // fallback to original
-	}
-
-	// capture current PATH for scheduled execution (launchd uses minimal environment)
-	currentPath := os.Getenv("PATH")
-	if currentPath == "" {
-		currentPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-	}
-
-	// build ProgramArguments: dotpak cron run [--config path]
-	programArgs := []string{resolvedPath, "cron", "run"}
-	if configFile != "" {
-		programArgs = []string{resolvedPath, "--config", configFile, "cron", "run"}
-	}
-
-	var argsXML strings.Builder
-	for _, arg := range programArgs {
-		escaped, escErr := xmlEscapeText(arg)
-		if escErr != nil {
-			return outputError(out, fmt.Errorf("escaping argument: %w", escErr))
-		}
-		fmt.Fprintf(&argsXML, "\n        <string>%s</string>", escaped)
-	}
-
-	escapedPath, err := xmlEscapeText(currentPath)
-	if err != nil {
-		return outputError(out, fmt.Errorf("escaping PATH: %w", err))
-	}
-
-	escapedHome, err := xmlEscapeText(home)
-	if err != nil {
-		return outputError(out, fmt.Errorf("escaping HOME: %w", err))
-	}
-
-	plistContent := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>dev.ospiem.dotpak</string>
-    <key>ProgramArguments</key>
-    <array>%s
-    </array>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>%d</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key>
-        <string>%s</string>
-        <key>PATH</key>
-        <string>%s</string>
-    </dict>
-</dict>
-</plist>
-`, argsXML.String(), hour, escapedHome, escapedPath)
-
-	if err = os.MkdirAll(filepath.Join(home, "Library", "LaunchAgents"), 0755); err != nil {
-		return outputError(out, fmt.Errorf("creating LaunchAgents directory: %w", err))
-	}
-
-	if err = os.WriteFile(plistPath, []byte(plistContent), 0644); err != nil {
-		return outputError(out, fmt.Errorf("writing plist: %w", err))
-	}
-
-	if err = exec.Command("launchctl", "load", plistPath).Run(); err != nil {
-		out.Warning("Failed to load LaunchAgent: %v\n", err)
-	}
-
-	out.Success("Installed daily backup at %d:00\n", hour)
-	out.Print("Plist: %s\n", plistPath)
-	out.Print("Binary: %s\n", resolvedPath)
-	out.Print("\nFor protected directories (Desktop, Documents, Downloads, iCloud):\n")
-	out.Print("  Add to System Settings → Privacy & Security → Full Disk Access:\n")
-	out.Print("  %s\n", resolvedPath)
-	return nil
-}
-
-func uninstallLaunchdCron(out *output.Output) error {
-	home, err := osutils.HomeDir()
-	if err != nil {
-		return outputError(out, err)
-	}
-	plistPath := filepath.Join(home, "Library", "LaunchAgents", "dev.ospiem.dotpak.plist")
-	_ = exec.Command("launchctl", "unload", plistPath).Run()
-
-	if err = os.Remove(plistPath); err != nil {
-		if os.IsNotExist(err) {
-			out.Warning("LaunchAgent not installed\n")
-			return nil
-		}
-		return outputError(out, fmt.Errorf("removing plist: %w", err))
-	}
-
-	out.Success("Uninstalled daily backup\n")
-	return nil
-}
-
-func launchdStatus(out *output.Output) error {
-	home, err := osutils.HomeDir()
-	if err != nil {
-		return outputError(out, err)
-	}
-	plistPath := filepath.Join(home, "Library", "LaunchAgents", "dev.ospiem.dotpak.plist")
-
-	// check if plist exists
-	if _, err = os.Stat(plistPath); err != nil {
-		if os.IsNotExist(err) {
-			out.Print("Status: not installed\n")
-			out.Print("\nRun 'dotpak cron install' to set up scheduled backups\n")
-			return nil
-		}
-		return outputError(out, fmt.Errorf("checking plist: %w", err))
-	}
-
-	out.Print("Status: installed\n")
-	out.Print("Plist: %s\n", plistPath)
-
-	// check launchctl status
-	cmdOut, err := exec.Command("launchctl", "list", "dev.ospiem.dotpak").CombinedOutput()
-	if err != nil {
-		out.Print("Launchd: not loaded (run 'launchctl load %s')\n", plistPath)
-	} else {
-		if strings.Contains(string(cmdOut), "PID") {
-			out.Print("Launchd: loaded\n")
-		} else {
-			out.Print("Launchd: loaded (idle)\n")
-		}
-	}
-
-	// load config to check FDA status
-	cfg, err := loadConfig("")
-	if err != nil {
-		out.Print("FDA: unknown (cannot load config)\n")
-		//nolint:nilerr // intentional: status display continues even if config fails
-		return nil
-	}
-
-	fdaStatus := checkFDAStatus(cfg.Backup.BackupDir, home)
-	out.Print("FDA: %s\n", fdaStatus)
-
-	return nil
-}
-
-func checkFDAStatus(backupDir, home string) string {
-	// expand backup dir
-	expandedBackupDir := backupDir
-	if strings.HasPrefix(expandedBackupDir, "~/") {
-		expandedBackupDir = filepath.Join(home, expandedBackupDir[2:])
-	}
-
-	// check if backup_dir is in protected location
-	protectedPrefixes := []string{
-		filepath.Join(home, "Desktop"),
-		filepath.Join(home, "Documents"),
-		filepath.Join(home, "Downloads"),
-		filepath.Join(home, "Library", "Mobile Documents"),
-	}
-
-	isProtected := false
-	for _, prefix := range protectedPrefixes {
-		if strings.HasPrefix(expandedBackupDir, prefix) {
-			isProtected = true
-			break
-		}
-	}
-
-	if !isProtected {
-		return "not required (backup_dir not in protected location)"
-	}
-
-	// try read-only access to the protected directory (or its parent)
-	dir, err := os.Open(expandedBackupDir)
-	if err != nil {
-		if os.IsPermission(err) {
-			return "NOT GRANTED - add dotpak binary to Full Disk Access"
-		}
-		// directory may not exist yet — try the parent
-		parentDir := filepath.Dir(expandedBackupDir)
-		dir, err = os.Open(parentDir)
-		if err != nil {
-			if os.IsPermission(err) {
-				return "NOT GRANTED - add dotpak binary to Full Disk Access"
-			}
-			return fmt.Sprintf("unknown (%v)", err)
-		}
-	}
-	_ = dir.Close()
-	return "granted"
-}
-
-const linuxCronMarker = "# dotpak"
-
-func installLinuxCron(hour int, out *output.Output) error {
-	home, err := osutils.HomeDir()
-	if err != nil {
-		return outputError(out, err)
-	}
-
-	execPath, err := os.Executable()
-	if err != nil {
-		return outputError(out, fmt.Errorf("getting executable path: %w", err))
-	}
-
-	logDir := filepath.Join(home, ".local", "share", "dotpak")
-	if err = os.MkdirAll(logDir, 0755); err != nil {
-		return outputError(out, fmt.Errorf("creating logs directory: %w", err))
-	}
-
-	// capture current PATH for scheduled execution (cron uses minimal /usr/bin:/bin)
-	currentPath := os.Getenv("PATH")
-	if currentPath == "" {
-		currentPath = "/usr/local/bin:/usr/bin:/bin"
-	}
-
-	cronCmd := buildCronCommand(cronBackupArgs(execPath))
-	logFile := shellQuote(filepath.Join(logDir, "backup.log"))
-	// use shell group to add timestamp before each run, combine stdout/stderr
-	cronLine := fmt.Sprintf(
-		"0 %d * * * { echo '---'; date -Iseconds; %s; } >> %s 2>&1 %s",
-		hour, cronCmd, logFile, linuxCronMarker,
-	)
-	pathLine := fmt.Sprintf("PATH=%s %s", currentPath, linuxCronMarker)
-
-	existing, err := readCrontab()
-	if err != nil {
-		return outputError(out, err)
-	}
-
-	lines, _ := filterDotpakCron(existing)
-	lines = append(lines, pathLine, cronLine)
-
-	if err = writeCrontab(strings.Join(lines, "\n") + "\n"); err != nil {
-		return outputError(out, err)
-	}
-
-	out.Success("Installed daily backup at %d:00\n", hour)
-	out.Print("Cron entry: %s\n", cronLine)
-	return nil
-}
-
-func uninstallLinuxCron(out *output.Output) error {
-	existing, err := readCrontab()
-	if err != nil {
-		return outputError(out, err)
-	}
-
-	lines, removed := filterDotpakCron(existing)
-	if !removed {
-		out.Warning("Cron entry not installed\n")
-		return nil
-	}
-
-	if len(lines) == 0 {
-		if err = exec.Command("crontab", "-r").Run(); err != nil {
-			return outputError(out, fmt.Errorf("removing crontab: %w", err))
-		}
-		out.Success("Uninstalled daily backup\n")
-		return nil
-	}
-
-	if err = writeCrontab(strings.Join(lines, "\n") + "\n"); err != nil {
-		return outputError(out, err)
-	}
-
-	out.Success("Uninstalled daily backup\n")
-	return nil
-}
-
-func linuxCronStatus(out *output.Output) error {
-	existing, err := readCrontab()
-	if err != nil {
-		return outputError(out, err)
-	}
-
-	// look for dotpak entry
-	found := false
-	var cronLine string
-	for line := range strings.SplitSeq(existing, "\n") {
-		if strings.HasSuffix(strings.TrimSpace(line), linuxCronMarker) {
-			if !strings.HasPrefix(line, "PATH=") {
-				found = true
-				cronLine = line
-			}
-		}
-	}
-
-	if !found {
-		out.Print("Status: not installed\n")
-		out.Print("\nRun 'dotpak cron install' to set up scheduled backups\n")
-		return nil
-	}
-
-	out.Print("Status: installed\n")
-	out.Print("Cron entry: %s\n", cronLine)
-	return nil
-}
-
-func buildCronCommand(args []string) string {
-	quoted := make([]string, 0, len(args))
-	for _, arg := range args {
-		quoted = append(quoted, shellQuote(arg))
-	}
-	return strings.Join(quoted, " ")
-}
-
-func xmlEscapeText(value string) (string, error) {
-	var buf bytes.Buffer
-	if err := xml.EscapeText(&buf, []byte(value)); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
-}
-
-func shellQuote(value string) string {
-	if value == "" {
-		return "''"
-	}
-	if !strings.ContainsAny(value, " \t\n'\"\\$") {
-		return value
-	}
-	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
-}
-
-func readCrontab() (string, error) {
-	out, err := exec.Command("crontab", "-l").CombinedOutput()
-	if err != nil {
-		if strings.Contains(string(out), "no crontab for") {
-			return "", nil
-		}
-		return "", fmt.Errorf("reading crontab: %w", err)
-	}
-	return string(out), nil
-}
-
-func writeCrontab(content string) error {
-	tmp, err := os.CreateTemp("", "dotpak-crontab-*")
-	if err != nil {
-		return fmt.Errorf("creating temp file: %w", err)
-	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
-
-	if _, err = tmp.WriteString(content); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("writing temp file: %w", err)
-	}
-	if err = tmp.Close(); err != nil {
-		return fmt.Errorf("closing temp file: %w", err)
-	}
-
-	// crontab <file> is atomic - if it fails, the original crontab is preserved
-	//nolint:gosec // g204: tmp.Name() is a temp file created by this function
-	if err = exec.Command("crontab", tmp.Name()).Run(); err != nil {
-		return fmt.Errorf("installing crontab: %w", err)
-	}
-	return nil
-}
-
-func filterDotpakCron(existing string) ([]string, bool) {
-	lines := strings.Split(strings.TrimRight(existing, "\n"), "\n")
-	filtered := make([]string, 0, len(lines))
-	removed := false
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		if strings.HasSuffix(strings.TrimSpace(line), linuxCronMarker) {
-			removed = true
-			continue
-		}
-		filtered = append(filtered, line)
-	}
-
-	return filtered, removed
+	return runErr
 }
 
 func findLatestBackup(backupDir string) string {
@@ -1297,261 +683,29 @@ func findLatestBackup(backupDir string) string {
 }
 
 func isArchiveFile(name string) bool {
-	return strings.HasPrefix(name, "dotfiles") &&
-		(strings.HasSuffix(name, ".tar.gz") || strings.HasSuffix(name, ".tar.gz.age") || strings.HasSuffix(name, ".tar.gz.gpg"))
-}
-
-func hasEncryptionExt(name string) bool {
-	return strings.HasSuffix(name, ".age") || strings.HasSuffix(name, ".gpg")
+	if !strings.HasPrefix(name, metadata.ArchivePrefix) {
+		return false
+	}
+	base := name
+	if method := crypto.DetectMethod(base); method != crypto.MethodNone {
+		base = strings.TrimSuffix(base, method.Extension())
+	}
+	return strings.HasSuffix(base, ".tar.gz")
 }
 
 // extractTimestamp extracts and formats the timestamp from an archive filename.
 // Archive names have the format: dotfiles-YYYYMMDD_HHMMSS.tar.gz[.age|.gpg]
 // Example: dotfiles-20240115_143022.tar.gz -> "2024-01-15 14:30:22".
 func extractTimestamp(name string) string {
-	// minimum length: "dotfiles-" (9) + "YYYYMMDD_HHMMSS" (15) = 24
-	const prefixLen = 9 // len("dotfiles-")
-	const tsLen = 15    // len("YYYYMMDD_HHMMSS")
-	const minNameLen = prefixLen + tsLen
+	prefixLen := len(metadata.ArchivePrefix)
+	tsLen := len(metadata.TimestampFormat) // YYYYMMDD_HHMMSS
 
-	if len(name) < minNameLen {
+	if len(name) < prefixLen+tsLen {
 		return ""
 	}
 	ts := name[prefixLen : prefixLen+tsLen]
-	if len(ts) != tsLen {
-		return ts
-	}
 	// format: YYYYMMDD_HHMMSS -> YYYY-MM-DD HH:MM:SS
 	return fmt.Sprintf("%s-%s-%s %s:%s:%s",
 		ts[0:4], ts[4:6], ts[6:8], // year, Month, Day
 		ts[9:11], ts[11:13], ts[13:15]) // hour, Minute, Second
-}
-
-// formatSize wraps osutils.FormatSize for local use.
-func formatSize(size int64) string {
-	return osutils.FormatSize(size)
-}
-
-func getSampleConfig() string {
-	return `# Dotpak configuration file
-# See https://github.com/ospiem/dotpak for documentation
-
-# Items to backup
-items = [
-    # Shell
-    ".zshrc",
-    ".bashrc",
-    ".profile",
-    ".zprofile",
-    ".bash_profile",
-    ".zsh",
-    ".zshenv",
-    ".oh-my-zsh/custom",
-    ".config/fish",
-    ".p10k.zsh",
-    # Git
-    ".gitconfig",
-    ".gitignore_global",
-    ".config/git",
-    # Editors
-    ".vimrc",
-    ".config/nvim",
-    ".emacs",
-    ".emacs.d",
-    ".config/helix",
-    ".config/zed",
-    # Terminal
-    ".tmux.conf",
-    ".config/alacritty",
-    ".config/kitty",
-    ".config/wezterm",
-    ".config/starship.toml",
-    ".config/zellij",
-    # macOS
-    ".config/raycast",
-    # Node.js
-    ".npmrc",
-    ".nvmrc",
-    ".yarnrc",
-    ".config/yarn",
-    ".bunfig.toml",
-    # Python
-    ".config/pip",
-    ".config/ruff",
-    ".config/mypy",
-    ".condarc",
-    ".jupyter",
-    # Ruby
-    ".gemrc",
-    ".irbrc",
-    ".pryrc",
-    # Java
-    ".gradle",
-    ".m2/settings.xml",
-    # Rust
-    ".cargo/config.toml",
-    ".rustup/settings.toml",
-    # Go
-    ".config/go",
-    # DevOps
-    ".ansible",
-    ".ansible.cfg",
-    ".config/podman",
-    # AI tools (settings)
-    ".claude/settings.json",
-    ".claude/projects",
-    ".codex/config.toml",
-    ".codex/skills",
-]
-
-# Sensitive items (only backed up with encryption)
-sensitive = [
-    # SSH
-    ".ssh",
-    # GPG
-    ".gnupg",
-    # Cloud credentials
-    ".aws",
-    ".config/gcloud",
-    ".azure",
-    ".kube",
-    ".s3cfg",
-    ".yandex",
-    # Terraform
-    ".terraform.d",
-    ".terraformrc",
-    # Python credentials
-    ".pypirc",
-    # Docker (may contain registry auth)
-    ".docker",
-    # Shell history
-    ".zsh_history",
-    ".bash_history",
-    ".lesshst",
-    # AI tools (auth/tokens)
-    ".claude.json",
-    ".codex/auth.json",
-    ".ai",
-]
-
-[backup]
-# Where to store backups
-backup_dir = "~/backups/dotfiles"
-
-# Number of backups to keep
-max_backups = 7
-
-# Encryption: "age" | "gpg" | "none"
-encryption = "none"
-
-# Path to age recipients file (for age encryption)
-# age_recipients = "~/.config/age/recipients.txt"
-
-# Path to age identity files (for age decryption)
-# age_identity_files = ["~/.config/age/keys.txt"]  # required for decrypting age backups
-
-# GPG recipient (for GPG encryption)
-# gpg_recipient = "your@email.com"
-
-# Exclude patterns
-[excludes]
-patterns = [
-    # General
-    ".git",
-    ".idea",
-    "*.log",
-    "*.swp",
-    "*.bak",
-    ".DS_Store",
-    "*.sock",
-    "*.cache",
-    # CI/CD and dev artifacts
-    ".circleci",
-    ".github",
-    ".travis.yml",
-    ".gitlab-ci.yml",
-    "Makefile",
-    "Dockerfile",
-    "*.md",
-    "LICENSE*",
-    "COPYING*",
-    "Gemfile*",
-    "*.spec",
-    "*.rb",
-    "test",
-    "tests",
-    "spec",
-    ".editorconfig",
-    ".gitignore",
-    ".gitattributes",
-    ".rspec",
-    ".rubocop*",
-    ".ruby-version",
-    # Python
-    "*.pyc",
-    "__pycache__",
-    ".venv",
-    "venv",
-    # Node
-    "node_modules",
-    # Java/Gradle/Maven
-    ".gradle/caches",
-    ".gradle/daemon",
-    ".m2/repository",
-    # Terraform
-    "*.tfstate",
-    "*.tfstate.*",
-    # GPG transient
-    "S.gpg-agent*",
-    "random_seed",
-    "*.status",
-    # Docker transient
-    ".token_seed*",
-    "buildx/refs",
-    "buildx/activity",
-    "buildx/.lock",
-    # SSH transient
-    "known_hosts.old",
-    # Zsh compiled
-    "*.zwc",
-    # Emacs
-    "*~",
-    "#*#",
-    ".emacs.d/elpa",
-    ".emacs.d/eln-cache",
-    # Vim/Neovim
-    ".config/nvim/lazy-lock.json",
-    # Ruby version managers (large)
-    ".rbenv/versions",
-    ".rvm/gems",
-    ".rvm/rubies",
-    # oh-my-zsh cloned plugins artifacts
-    "gitstatus/src",
-    "gitstatus/deps",
-    "gitstatus/usrbin",
-    "*.png",
-    "*.gif",
-    "*.jpg",
-    "*.svg",
-    "test-data",
-    "docs",
-    # Misc dev files
-    "*.sh",
-    "DESCRIPTION",
-    "URL",
-    "VERSION",
-    "ZSH_VERSIONS",
-    ".revision-hash",
-    ".version",
-]
-
-# Named profiles
-# Use with: dotpak backup --profile work
-# [profile.work]
-# extra_items = [".config/slack"]
-
-# Hostname-specific settings (applied automatically)
-# [host.my-macbook]
-# extra_items = [".config/work-specific"]
-`
 }

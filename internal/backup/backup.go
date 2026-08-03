@@ -4,6 +4,7 @@ package backup
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -38,154 +39,71 @@ type Backup struct {
 }
 
 // New creates a new Backup instance.
-// Returns nil if the home directory cannot be determined.
-func New(cfg *config.Config, opts *Options, out *output.Output) *Backup {
+func New(cfg *config.Config, opts *Options, out *output.Output) (*Backup, error) {
 	home, err := osutils.HomeDir()
 	if err != nil {
-		out.Error("Cannot determine home directory: %v\n", err)
-		return nil
+		return nil, fmt.Errorf("cannot determine home directory: %w", err)
 	}
 	return &Backup{
 		cfg:     cfg,
 		opts:    opts,
 		out:     out,
 		homeDir: home,
-	}
+	}, nil
 }
 
-// Run executes the backup.
-func (b *Backup) Run() (*metadata.BackupResult, error) {
-	result := &metadata.BackupResult{
-		Success: false,
-	}
+// fail records err in the result for the JSON envelope and returns it as the
+// authoritative error.
+func fail(result *metadata.BackupResult, err error) (*metadata.BackupResult, error) {
+	result.Error = err.Error()
+	return result, err
+}
 
-	if b == nil {
-		result.Error = "backup not initialized (home directory error)"
-		return result, errors.New(result.Error)
-	}
+// Run executes the backup. On failure the returned error is authoritative;
+// result.Error carries the same message for the JSON envelope.
+func (b *Backup) Run() (*metadata.BackupResult, error) {
+	result := &metadata.BackupResult{}
 
 	if err := os.MkdirAll(b.cfg.Backup.BackupDir, 0700); err != nil {
-		errMsg := fmt.Sprintf("creating backup directory: %v", err)
-		if os.IsPermission(err) && runtime.GOOS == "darwin" {
-			execPath, _ := os.Executable()
-			resolvedPath, _ := filepath.EvalSymlinks(execPath)
-			if resolvedPath == "" {
-				resolvedPath = execPath
-			}
-			errMsg += fmt.Sprintf(
-				"\n\nFull Disk Access may be required. "+
-					"Add to System Settings → Privacy & Security → Full Disk Access:\n  %s",
-				resolvedPath,
-			)
-		}
-		result.Error = errMsg
-		return result, nil
+		return fail(result, fmt.Errorf("creating backup directory: %w%s", err, fdaHint(err)))
 	}
 
-	encMethod, recipientsFile, gpgRecipient, err := b.resolveEncryption()
+	method, recipientsFile, gpgRecipient, err := b.resolveEncryption()
 	if err != nil {
-		result.Error = err.Error()
-		//nolint:nilerr // error captured in result.Error for structured JSON response
-		return result, nil
+		return fail(result, err)
 	}
 
 	b.out.Print("Collecting files...\n")
-	files := b.collectFiles(encMethod != "")
+	files := b.collectFiles(method != crypto.MethodNone)
 
 	if len(files) == 0 {
-		result.Error = "no files to backup"
-		return result, nil
+		return fail(result, errors.New("no files to backup"))
 	}
 
 	b.out.Print("Found %d files to backup\n", len(files))
 
 	if b.opts.Estimate {
-		var totalSize int64
-		for _, f := range files {
-			totalSize += f.Size
-		}
-		b.out.Print("\nEstimate:\n")
-		b.out.Print("  Files: %d\n", len(files))
-		b.out.Print("  Size: %s\n", formatSize(totalSize))
-
+		b.printEstimate(files)
 		result.Success = true
 		result.Stats = b.stats
 		return result, nil
 	}
 
 	if b.opts.DryRun {
-		b.out.Print("\nDry run - would backup:\n")
-		for _, f := range files {
-			b.out.Print("  %s\n", f.RelPath)
-		}
-
-		if encMethod != "" {
-			b.out.Print("\nWould encrypt with: %s\n", encMethod)
-		}
-
+		b.printDryRun(files, method)
 		result.Success = true
-		result.Encrypted = encMethod != ""
-		result.EncryptionMethod = encMethod
+		result.Encrypted = method != crypto.MethodNone
+		result.EncryptionMethod = string(method)
 		result.Stats = b.stats
 		return result, nil
 	}
 
-	timestamp := time.Now().Format("20060102_150405")
-	archivePath := filepath.Join(b.cfg.Backup.BackupDir, fmt.Sprintf("dotfiles-%s.tar.gz", timestamp))
-
-	var finalArchive string
-	if encMethod != "" {
-		b.out.Print("Creating encrypted archive with %s...\n", encMethod)
-
-		enc, encErr := crypto.NewEncryptor(crypto.Method(encMethod), crypto.Options{
-			AgeRecipientsFile: recipientsFile,
-			GPGRecipient:      gpgRecipient,
-		})
-		if encErr != nil {
-			result.Error = fmt.Sprintf("encryption failed: %v", encErr)
-			return result, nil
-		}
-
-		encryptedPath := archivePath + "." + encMethod
-		if encErr = b.createEncryptedArchive(encryptedPath, files, enc); encErr != nil {
-			_ = os.Remove(encryptedPath)
-			result.Error = fmt.Sprintf("creating encrypted archive: %v", encErr)
-			return result, nil
-		}
-		finalArchive = encryptedPath
-	} else {
-		b.out.Print("Creating archive: %s\n", filepath.Base(archivePath))
-		if err = b.createArchive(archivePath, files); err != nil {
-			errMsg := fmt.Sprintf("creating archive: %v", err)
-			if os.IsPermission(err) && runtime.GOOS == "darwin" {
-				execPath, _ := os.Executable()
-				resolvedPath, _ := filepath.EvalSymlinks(execPath)
-				if resolvedPath == "" {
-					resolvedPath = execPath
-				}
-				errMsg += fmt.Sprintf(
-					"\n\nFull Disk Access may be required. "+
-						"Add to System Settings → Privacy & Security → Full Disk Access:\n  %s",
-					resolvedPath,
-				)
-			}
-			result.Error = errMsg
-			return result, nil
-		}
-		finalArchive = archivePath
+	finalArchive, err := b.createFinalArchive(files, method, recipientsFile, gpgRecipient)
+	if err != nil {
+		return fail(result, err)
 	}
 
-	meta := metadata.New()
-	meta.Encrypted = encMethod != ""
-	meta.EncryptionMethod = encMethod
-	meta.OSVersion = metadata.GetOSVersion()
-	meta.Stats = b.stats
-
-	metadataPath := metadata.GetMetadataPath(finalArchive)
-	if err = meta.Save(metadataPath); err != nil {
-		b.out.Warning("Failed to save metadata: %v\n", err)
-	}
-
+	b.saveMetadata(finalArchive, method)
 	b.backupHomebrew()
 	b.backupMASApps()
 	b.backupAptPackages()
@@ -194,10 +112,77 @@ func (b *Backup) Run() (*metadata.BackupResult, error) {
 
 	result.Success = true
 	result.Archive = finalArchive
-	result.Encrypted = meta.Encrypted
-	result.EncryptionMethod = meta.EncryptionMethod
+	result.Encrypted = method != crypto.MethodNone
+	result.EncryptionMethod = string(method)
 	result.Stats = b.stats
 
+	b.printSummary(finalArchive)
+	return result, nil
+}
+
+func (b *Backup) printEstimate(files []FileInfo) {
+	var totalSize int64
+	for _, f := range files {
+		totalSize += f.Size
+	}
+	b.out.Print("\nEstimate:\n")
+	b.out.Print("  Files: %d\n", len(files))
+	b.out.Print("  Size: %s\n", osutils.FormatSize(totalSize))
+}
+
+func (b *Backup) printDryRun(files []FileInfo, method crypto.Method) {
+	b.out.Print("\nDry run - would backup:\n")
+	for _, f := range files {
+		b.out.Print("  %s\n", f.RelPath)
+	}
+	if method != crypto.MethodNone {
+		b.out.Print("\nWould encrypt with: %s\n", method)
+	}
+}
+
+// createFinalArchive writes the archive (encrypted or not) and returns its path.
+func (b *Backup) createFinalArchive(
+	files []FileInfo,
+	method crypto.Method,
+	recipientsFile, gpgRecipient string,
+) (string, error) {
+	archivePath := metadata.GenerateArchiveName(b.cfg.Backup.BackupDir, method)
+
+	if method == crypto.MethodNone {
+		b.out.Print("Creating archive: %s\n", filepath.Base(archivePath))
+		if err := b.createArchive(archivePath, files); err != nil {
+			return "", fmt.Errorf("creating archive: %w%s", err, fdaHint(err))
+		}
+		return archivePath, nil
+	}
+
+	b.out.Print("Creating encrypted archive with %s...\n", method)
+	enc, err := crypto.NewEncryptor(method, crypto.Options{
+		AgeRecipientsFile: recipientsFile,
+		GPGRecipient:      gpgRecipient,
+	})
+	if err != nil {
+		return "", fmt.Errorf("encryption failed: %w", err)
+	}
+	if encArchiveErr := b.createEncryptedArchive(archivePath, files, enc); encArchiveErr != nil {
+		return "", fmt.Errorf("creating encrypted archive: %w", encArchiveErr)
+	}
+	return archivePath, nil
+}
+
+func (b *Backup) saveMetadata(finalArchive string, method crypto.Method) {
+	meta := metadata.New()
+	meta.Encrypted = method != crypto.MethodNone
+	meta.EncryptionMethod = string(method)
+	meta.OSVersion = metadata.GetOSVersion()
+	meta.Stats = b.stats
+
+	if err := meta.Save(metadata.GetMetadataPath(finalArchive)); err != nil {
+		b.out.Warning("Failed to save metadata: %v\n", err)
+	}
+}
+
+func (b *Backup) printSummary(finalArchive string) {
 	b.out.Success("\nBackup complete: %s\n", filepath.Base(finalArchive))
 	b.out.Print("  Files: %d\n", b.stats.FilesBackedUp)
 	b.out.Print("  Skipped: %d\n", b.stats.FilesSkipped)
@@ -207,22 +192,37 @@ func (b *Backup) Run() (*metadata.BackupResult, error) {
 	if b.stats.SensitiveFiles > 0 {
 		b.out.Print("  Sensitive: %d\n", b.stats.SensitiveFiles)
 	}
-
-	return result, nil
 }
 
-func (b *Backup) resolveEncryption() (method, recipientsFile, gpgRecipient string, err error) {
-	method = b.opts.EncryptionMethod
+// fdaHint returns a Full Disk Access hint for macOS permission errors, or "".
+func fdaHint(err error) string {
+	if runtime.GOOS != "darwin" || !errors.Is(err, fs.ErrPermission) {
+		return ""
+	}
+	execPath, _ := os.Executable()
+	resolvedPath, _ := filepath.EvalSymlinks(execPath)
+	if resolvedPath == "" {
+		resolvedPath = execPath
+	}
+	return fmt.Sprintf(
+		"\n\nFull Disk Access may be required. "+
+			"Add to System Settings → Privacy & Security → Full Disk Access:\n  %s",
+		resolvedPath,
+	)
+}
 
-	if method == "" {
-		method = b.cfg.Backup.Encryption
+func (b *Backup) resolveEncryption() (method crypto.Method, recipientsFile, gpgRecipient string, err error) {
+	m := b.opts.EncryptionMethod
+
+	if m == "" {
+		m = b.cfg.Backup.Encryption
 	}
 
-	if method == "none" || method == "" {
-		return "", "", "", nil
+	if m == "none" || m == "" {
+		return crypto.MethodNone, "", "", nil
 	}
 
-	if method == "age" {
+	if m == "age" {
 		recipientsFile = b.opts.RecipientsFile
 		if recipientsFile == "" {
 			recipientsFile = b.cfg.Backup.AgeRecipients
@@ -233,10 +233,10 @@ func (b *Backup) resolveEncryption() (method, recipientsFile, gpgRecipient strin
 		if _, statErr := os.Stat(recipientsFile); statErr != nil {
 			return "", "", "", fmt.Errorf("age recipients file not found: %s", recipientsFile)
 		}
-		return "age", recipientsFile, "", nil
+		return crypto.MethodAge, recipientsFile, "", nil
 	}
 
-	if method == "gpg" {
+	if m == "gpg" {
 		gpgRecipient = b.opts.GPGRecipient
 		if gpgRecipient == "" {
 			gpgRecipient = b.cfg.Backup.GPGRecipient
@@ -244,20 +244,20 @@ func (b *Backup) resolveEncryption() (method, recipientsFile, gpgRecipient strin
 		if gpgRecipient == "" {
 			return "", "", "", errors.New("gpg encryption requested but no recipient specified")
 		}
-		return "gpg", "", gpgRecipient, nil
+		return crypto.MethodGPG, "", gpgRecipient, nil
 	}
 
-	return "", "", "", fmt.Errorf("unknown encryption method: %s", method)
+	return "", "", "", fmt.Errorf("unknown encryption method: %s", m)
 }
 
 func (b *Backup) collectFiles(includeSecrets bool) []FileInfo {
 	var files []FileInfo
 	var totalSize int64
 
-	for _, item := range b.cfg.GetBackupItems() {
-		collected, err := b.collectItem(item.Path)
+	for _, item := range b.cfg.Items {
+		collected, err := b.collectItem(item)
 		if err != nil {
-			b.out.Verbose("Skipping %s: %v\n", item.Path, err)
+			b.out.Verbose("Skipping %s: %v\n", item, err)
 			b.stats.FilesSkipped++
 			continue
 		}
@@ -268,10 +268,10 @@ func (b *Backup) collectFiles(includeSecrets bool) []FileInfo {
 	}
 
 	if includeSecrets && b.opts.IncludeSecrets {
-		for _, item := range b.cfg.GetSensitiveItems() {
-			collected, err := b.collectItem(item.Path)
+		for _, item := range b.cfg.Sensitive {
+			collected, err := b.collectItem(item)
 			if err != nil {
-				b.out.Verbose("Skipping sensitive %s: %v\n", item.Path, err)
+				b.out.Verbose("Skipping sensitive %s: %v\n", item, err)
 				continue
 			}
 			for i := range collected {
@@ -313,6 +313,13 @@ func (b *Backup) collectItem(relPath string) ([]FileInfo, error) {
 	if !info.IsDir() {
 		if b.isExcluded(relPath) {
 			b.stats.FilesExcluded++
+			return nil, nil
+		}
+		// FIFOs, sockets, and devices are not archivable; opening a FIFO with
+		// no writer would block the backup forever.
+		if !info.Mode().IsRegular() {
+			b.out.Verbose("Skipping non-regular file %s (%s)\n", relPath, info.Mode())
+			b.stats.FilesSkipped++
 			return nil, nil
 		}
 		return []FileInfo{{
@@ -371,6 +378,14 @@ func (b *Backup) collectItem(relPath string) ([]FileInfo, error) {
 		}
 		if b.isExcluded(rel) {
 			b.stats.FilesExcluded++
+			return nil
+		}
+
+		// FIFOs, sockets, and devices are not archivable; opening a FIFO with
+		// no writer would block the backup forever.
+		if !d.Type().IsRegular() {
+			b.out.Verbose("Skipping non-regular file %s (%s)\n", rel, d.Type())
+			b.stats.FilesSkipped++
 			return nil
 		}
 
@@ -437,11 +452,11 @@ func (b *Backup) cleanupOldBackups() {
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "dotfiles-") {
+		if !strings.HasPrefix(name, metadata.ArchivePrefix) {
 			continue
 		}
 
-		parts := strings.SplitN(strings.TrimPrefix(name, "dotfiles-"), ".", 2)
+		parts := strings.SplitN(strings.TrimPrefix(name, metadata.ArchivePrefix), ".", 2)
 		if len(parts) > 0 {
 			timestamp := parts[0]
 			groups[timestamp] = append(groups[timestamp], filepath.Join(b.cfg.Backup.BackupDir, name))
@@ -605,8 +620,4 @@ type FileInfo struct {
 	Size      int64
 	ModTime   time.Time
 	Sensitive bool
-}
-
-func formatSize(size int64) string {
-	return osutils.FormatSize(size)
 }

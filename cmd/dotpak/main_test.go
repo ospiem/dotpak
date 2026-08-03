@@ -3,99 +3,11 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"runtime"
+	"slices"
 	"testing"
+
+	"github.com/ospiem/dotpak/internal/config"
 )
-
-func TestCheckFDAStatus(t *testing.T) {
-	t.Parallel()
-
-	home := t.TempDir()
-
-	t.Run("not required when backup_dir is outside protected locations", func(t *testing.T) {
-		backupDir := filepath.Join(home, "backups")
-		result := checkFDAStatus(backupDir, home)
-		if result != "not required (backup_dir not in protected location)" {
-			t.Errorf("unexpected result: %s", result)
-		}
-	})
-
-	t.Run("granted when protected dir is accessible", func(t *testing.T) {
-		// create a dir under "Desktop" to simulate a protected location
-		desktopBackup := filepath.Join(home, "Desktop", "backups")
-		if err := os.MkdirAll(desktopBackup, 0755); err != nil {
-			t.Fatalf("failed to create dir: %v", err)
-		}
-		result := checkFDAStatus(desktopBackup, home)
-		if result != "granted" {
-			t.Errorf("expected granted, got: %s", result)
-		}
-	})
-
-	t.Run("falls back to parent when dir does not exist", func(t *testing.T) {
-		// desktop exists but backups/subfolder does not
-		desktop := filepath.Join(home, "Desktop")
-		if err := os.MkdirAll(desktop, 0755); err != nil {
-			t.Fatalf("failed to create dir: %v", err)
-		}
-		nonExistent := filepath.Join(desktop, "backups", "subfolder")
-		result := checkFDAStatus(nonExistent, home)
-		// parent Desktop exists and is accessible
-		if result != "granted" {
-			t.Errorf("expected granted via parent, got: %s", result)
-		}
-	})
-
-	t.Run("expands tilde prefix", func(t *testing.T) {
-		result := checkFDAStatus("~/some/path", home)
-		if result != "not required (backup_dir not in protected location)" {
-			t.Errorf("unexpected result: %s", result)
-		}
-	})
-
-	t.Run("recognizes all protected prefixes", func(t *testing.T) {
-		protectedDirs := []string{"Desktop", "Documents", "Downloads"}
-		for _, dir := range protectedDirs {
-			dirPath := filepath.Join(home, dir)
-			if err := os.MkdirAll(dirPath, 0755); err != nil {
-				t.Fatalf("failed to create %s: %v", dir, err)
-			}
-			result := checkFDAStatus(dirPath, home)
-			if result != "granted" {
-				t.Errorf("expected granted for %s, got: %s", dir, result)
-			}
-		}
-	})
-}
-
-func TestCronLogPath(t *testing.T) {
-	t.Parallel()
-
-	logPath, err := cronLogPath()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if logPath == "" {
-		t.Fatal("expected non-empty log path")
-	}
-
-	switch runtime.GOOS {
-	case "darwin":
-		if !filepath.IsAbs(logPath) {
-			t.Error("expected absolute path")
-		}
-		if filepath.Base(logPath) != "backup.log" {
-			t.Errorf("expected backup.log, got %s", filepath.Base(logPath))
-		}
-	case "linux":
-		if !filepath.IsAbs(logPath) {
-			t.Error("expected absolute path")
-		}
-		if filepath.Base(logPath) != "backup.log" {
-			t.Errorf("expected backup.log, got %s", filepath.Base(logPath))
-		}
-	}
-}
 
 func TestExtractTimestamp(t *testing.T) {
 	t.Parallel()
@@ -121,11 +33,85 @@ func TestExtractTimestamp(t *testing.T) {
 	}
 }
 
-func TestLinuxCronStatus(t *testing.T) {
+func TestIsArchiveFile(t *testing.T) {
 	t.Parallel()
 
-	if runtime.GOOS != "linux" {
-		t.Skip("linux-only test")
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"dotfiles-20250115_143022.tar.gz", true},
+		{"dotfiles-20250115_143022.tar.gz.age", true},
+		{"dotfiles-20250115_143022.tar.gz.gpg", true},
+		{"dotfiles-20250115_143022.tar.gz.partial", false},
+		{"dotfiles-20250115_143022.json", false},
+		{"pre-restore-20250115_143022.tar.gz", false},
+		{"Brewfile", false},
 	}
-	// just verify it doesn't panic when crontab may not exist
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isArchiveFile(tt.name); got != tt.want {
+				t.Errorf("isArchiveFile(%q) = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSampleConfigMatchesDefaults guards against drift between the commented
+// template written by `dotpak config init` and config.DefaultConfig() — the
+// two must describe the same configuration.
+func TestSampleConfigMatchesDefaults(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	samplePath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(samplePath, []byte(getSampleConfig()), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	sample, err := config.Load(samplePath)
+	if err != nil {
+		t.Fatalf("sample config does not parse: %v", err)
+	}
+	defaults := config.DefaultConfig()
+
+	if sample.Backup.MaxBackups != defaults.Backup.MaxBackups {
+		t.Errorf("max_backups drifted: sample %d, default %d",
+			sample.Backup.MaxBackups, defaults.Backup.MaxBackups)
+	}
+	if sample.Backup.Encryption != defaults.Backup.Encryption {
+		t.Errorf("encryption drifted: sample %q, default %q",
+			sample.Backup.Encryption, defaults.Backup.Encryption)
+	}
+	if sample.Backup.BackupDir != defaults.Backup.BackupDir {
+		t.Errorf("backup_dir drifted: sample %q, default %q",
+			sample.Backup.BackupDir, defaults.Backup.BackupDir)
+	}
+
+	assertSameSet(t, "items", sample.Items, defaults.Items)
+	assertSameSet(t, "sensitive", sample.Sensitive, defaults.Sensitive)
+	assertSameSet(t, "excludes.patterns", sample.Excludes.Patterns, defaults.Excludes.Patterns)
+}
+
+func assertSameSet(t *testing.T, what string, got, want []string) {
+	t.Helper()
+
+	gotSorted := slices.Clone(got)
+	wantSorted := slices.Clone(want)
+	slices.Sort(gotSorted)
+	slices.Sort(wantSorted)
+
+	if !slices.Equal(gotSorted, wantSorted) {
+		for _, v := range wantSorted {
+			if !slices.Contains(gotSorted, v) {
+				t.Errorf("%s: sample config is missing %q", what, v)
+			}
+		}
+		for _, v := range gotSorted {
+			if !slices.Contains(wantSorted, v) {
+				t.Errorf("%s: sample config has extra %q", what, v)
+			}
+		}
+	}
 }

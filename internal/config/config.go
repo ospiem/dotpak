@@ -203,33 +203,32 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}
 
-	// start with empty config so config file completely replaces defaults
-	cfg := &Config{
-		Profiles: make(map[string]Profile),
-		Hosts:    make(map[string]HostConfig),
-	}
+	// decode over defaults: keys present in the file replace the default value
+	// (including whole arrays like items), omitted keys keep their defaults.
+	// This also means max_backups = 0 is honored as "keep all" instead of
+	// being silently coerced back to the default.
+	cfg := DefaultConfig()
 
 	if _, decodeErr := toml.Decode(string(data), cfg); decodeErr != nil {
 		return nil, fmt.Errorf("parsing config: %w", decodeErr)
 	}
 
-	if cfg.Backup.MaxBackups == 0 {
-		cfg.Backup.MaxBackups = 14
-	}
 	if cfg.Backup.Encryption == "" {
 		cfg.Backup.Encryption = "none"
 	}
 
-	cfg.Backup.BackupDir = expandPath(cfg.Backup.BackupDir)
-	cfg.Backup.AgeRecipients = expandPath(cfg.Backup.AgeRecipients)
+	cfg.Backup.BackupDir = osutils.ExpandPath(cfg.Backup.BackupDir)
+	cfg.Backup.AgeRecipients = osutils.ExpandPath(cfg.Backup.AgeRecipients)
 	cfg.Backup.AgeIdentityFiles = expandPaths(cfg.Backup.AgeIdentityFiles)
 
-	// expand ~ in Items and Sensitive paths
+	// Items and Sensitive are consumed as paths relative to $HOME by backup/restore,
+	// so normalize any ~/ or absolute-under-$HOME forms back to home-relative.
+	home, _ := osutils.HomeDir()
 	for i, item := range cfg.Items {
-		cfg.Items[i] = expandPath(item)
+		cfg.Items[i] = normalizeItemPath(item, home)
 	}
 	for i, item := range cfg.Sensitive {
-		cfg.Sensitive[i] = expandPath(item)
+		cfg.Sensitive[i] = normalizeItemPath(item, home)
 	}
 
 	return cfg, nil
@@ -291,38 +290,30 @@ func (c *Config) applyProfile(profile Profile) {
 	}
 }
 
-// GetBackupItems returns the list of items to backup.
-func (c *Config) GetBackupItems() []BackupItem {
-	items := make([]BackupItem, 0, len(c.Items))
-	for _, path := range c.Items {
-		items = append(items, BackupItem{Path: path})
+// normalizeItemPath converts a config item path to the home-relative form
+// consumed by backup/restore: "~/" and "$HOME/" prefixes are stripped, and
+// absolute paths under home are made relative to it. Paths that cannot be
+// normalized (absolute outside home, or absolute when home is unknown) are
+// returned cleaned so the mismatch surfaces as "not found" during backup.
+func normalizeItemPath(item, home string) string {
+	item = strings.TrimSpace(item)
+	if item == "" {
+		return ""
 	}
-	return items
-}
-
-// GetSensitiveItems returns the list of sensitive items.
-func (c *Config) GetSensitiveItems() []BackupItem {
-	items := make([]BackupItem, 0, len(c.Sensitive))
-	for _, path := range c.Sensitive {
-		items = append(items, BackupItem{Path: path})
+	switch {
+	case item == "~" || item == "$HOME":
+		return "."
+	case strings.HasPrefix(item, "~/"):
+		item = item[len("~/"):]
+	case strings.HasPrefix(item, "$HOME/"):
+		item = item[len("$HOME/"):]
 	}
-	return items
-}
-
-// BackupItem represents an item to backup.
-type BackupItem struct {
-	Path string
-}
-
-func expandPath(path string) string {
-	if strings.HasPrefix(path, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return path // return unexpanded on error
+	if filepath.IsAbs(item) && home != "" {
+		if rel, err := filepath.Rel(home, item); err == nil && rel != ".." && !strings.HasPrefix(rel, "../") {
+			item = rel
 		}
-		return filepath.Join(home, path[2:])
 	}
-	return path
+	return filepath.Clean(item)
 }
 
 func expandPaths(paths []string) []string {
@@ -335,7 +326,7 @@ func expandPaths(paths []string) []string {
 		if path == "" {
 			continue
 		}
-		expanded = append(expanded, expandPath(path))
+		expanded = append(expanded, osutils.ExpandPath(path))
 	}
 	return expanded
 }

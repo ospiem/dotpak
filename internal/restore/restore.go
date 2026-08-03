@@ -11,17 +11,24 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/sergi/go-diff/diffmatchpatch"
 
-	"github.com/ospiem/dotpak/internal/backup"
+	"github.com/ospiem/dotpak/internal/archive"
 	"github.com/ospiem/dotpak/internal/config"
 	"github.com/ospiem/dotpak/internal/crypto"
 	"github.com/ospiem/dotpak/internal/metadata"
 	"github.com/ospiem/dotpak/internal/osutils"
 	"github.com/ospiem/dotpak/internal/output"
+)
+
+// Extraction limits guard against decompression bombs.
+const (
+	maxExtractFileSize  = 1 << 30  // 1GB per file
+	maxExtractTotalSize = 10 << 30 // 10GB total
 )
 
 // Categories maps category names to path prefixes.
@@ -59,6 +66,25 @@ var Categories = map[string][]string{
 	"ai":      {".claude", ".claude.json", ".codex", ".ai"},
 }
 
+// CategoryNames returns the sorted list of restore category names.
+func CategoryNames() []string {
+	names := make([]string, 0, len(Categories))
+	for name := range Categories {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func validateCategories(categories []string) error {
+	for _, cat := range categories {
+		if _, ok := Categories[strings.ToLower(cat)]; !ok {
+			return fmt.Errorf("unknown category %q (available: %s)", cat, strings.Join(CategoryNames(), ", "))
+		}
+	}
+	return nil
+}
+
 // Options holds restore options.
 type Options struct {
 	DryRun      bool
@@ -74,22 +100,24 @@ type Restore struct {
 	opts    *Options
 	out     *output.Output
 	homeDir string
+	// identityFiles are the age identities resolved once per run: a restore
+	// decrypts the archive twice (safety-backup scan, then extraction) and a
+	// stdin identity can only be read once.
+	identityFiles []string
 }
 
 // New creates a new Restore instance.
-// Returns nil if home directory cannot be determined.
-func New(cfg *config.Config, opts *Options, out *output.Output) *Restore {
+func New(cfg *config.Config, opts *Options, out *output.Output) (*Restore, error) {
 	home, err := osutils.HomeDir()
 	if err != nil {
-		out.Error("Cannot determine home directory: %v\n", err)
-		return nil
+		return nil, fmt.Errorf("cannot determine home directory: %w", err)
 	}
 	return &Restore{
 		cfg:     cfg,
 		opts:    opts,
 		out:     out,
 		homeDir: home,
-	}
+	}, nil
 }
 
 // sensitivePatterns are path prefixes that indicate sensitive files.
@@ -110,22 +138,29 @@ func (r *Restore) containsSensitiveFiles(files []string) bool {
 	return false
 }
 
-// canEncrypt checks if encryption is properly configured.
-func (r *Restore) canEncrypt() bool {
-	if r.cfg.Backup.AgeRecipients != "" {
+// configEncryptionMethod returns the encryption method usable with the current
+// config and installed tools, or MethodNone.
+func (r *Restore) configEncryptionMethod() crypto.Method {
+	if r.cfg.Backup.AgeRecipients != "" && crypto.HasAge() {
 		if _, err := os.Stat(r.cfg.Backup.AgeRecipients); err == nil {
-			return crypto.HasAge()
+			return crypto.MethodAge
 		}
 	}
-	if r.cfg.Backup.GPGRecipient != "" {
-		return crypto.HasGPG()
+	if r.cfg.Backup.GPGRecipient != "" && crypto.HasGPG() {
+		return crypto.MethodGPG
 	}
-	return false
+	return crypto.MethodNone
 }
 
 // promptForSensitiveBackup prompts the user for how to handle sensitive files in the safety backup
 // when encryption is not available.
 func (r *Restore) promptForSensitiveBackup(files []string) ([]string, error) {
+	if r.out.Mode() != output.ModeNormal {
+		// prompting would be invisible (and block) in quiet/JSON mode
+		return nil, errors.New("safety backup contains sensitive files but no encryption is configured; " +
+			"configure encryption, pass --no-backup, or run interactively to choose")
+	}
+
 	r.out.Warning("Safety backup contains sensitive files but no encryption is configured.\n")
 	r.out.Print("Options:\n")
 	r.out.Print("  1. Save without encryption\n")
@@ -171,45 +206,43 @@ func (r *Restore) filterSensitiveFiles(files []string) []string {
 	return filtered
 }
 
-// Run executes the restore from an archive.
+// fail records err in the result for the JSON envelope and returns it as the
+// authoritative error.
+func fail(result *metadata.RestoreResult, err error) (*metadata.RestoreResult, error) {
+	result.Error = err.Error()
+	return result, err
+}
+
+// Run executes the restore from an archive. On failure the returned error is
+// authoritative; result.Error carries the same message for the JSON envelope.
 func (r *Restore) Run(archivePath string) (*metadata.RestoreResult, error) {
 	result := &metadata.RestoreResult{
-		Success: false,
-		Archive: archivePath,
-		DryRun:  r != nil && r.opts.DryRun,
+		Archive:    archivePath,
+		DryRun:     r.opts.DryRun,
+		Categories: r.opts.Categories,
 	}
 
-	if r == nil {
-		result.Error = "restore not initialized (home directory error)"
-		return result, fmt.Errorf("%s", result.Error)
+	if err := validateCategories(r.opts.Categories); err != nil {
+		return fail(result, err)
 	}
-
-	result.Categories = r.opts.Categories
 
 	if _, err := os.Stat(archivePath); err != nil {
-		result.Error = fmt.Sprintf("archive not found: %s", archivePath)
-		return result, nil
+		return fail(result, fmt.Errorf("archive not found: %s", archivePath))
 	}
 
-	tarPath := archivePath
-	needsDecrypt := strings.HasSuffix(archivePath, ".age") || strings.HasSuffix(archivePath, ".gpg")
-
-	if needsDecrypt {
-		r.out.Print("Decrypting archive...\n")
-		decrypted, err := r.decryptArchive(archivePath)
-		if err != nil {
-			result.Error = fmt.Sprintf("decryption failed: %v", err)
-			return result, nil
-		}
-		tarPath = decrypted
-		defer os.Remove(tarPath)
+	identityFiles, cleanup, identityErr := resolveAgeIdentityFor(archivePath, r.opts.AgeIdentity, r.cfg)
+	if identityErr != nil {
+		return fail(result, identityErr)
 	}
+	defer cleanup()
+	r.identityFiles = identityFiles
 
 	if !r.opts.NoBackup && !r.opts.DryRun {
-		safetyPath, err := r.createSafetyBackup(tarPath, archivePath)
+		safetyPath, err := r.createSafetyBackup(archivePath)
 		if err != nil {
-			r.out.Warning("Failed to create safety backup: %v\n", err)
-		} else if safetyPath != "" {
+			return fail(result, fmt.Errorf("safety backup failed: %w (use --no-backup to restore without one)", err))
+		}
+		if safetyPath != "" {
 			result.SafetyBackup = safetyPath
 			r.out.Print("Created safety backup: %s\n", filepath.Base(safetyPath))
 		}
@@ -221,10 +254,9 @@ func (r *Restore) Run(archivePath string) (*metadata.RestoreResult, error) {
 		r.out.Print("\nRestoring files...\n")
 	}
 
-	count, err := r.extractArchive(tarPath)
+	count, err := r.extractArchive(archivePath)
 	if err != nil {
-		result.Error = fmt.Sprintf("extraction failed: %v", err)
-		return result, nil
+		return fail(result, fmt.Errorf("extraction failed: %w", err))
 	}
 
 	result.Success = true
@@ -238,31 +270,12 @@ func (r *Restore) Run(archivePath string) (*metadata.RestoreResult, error) {
 	return result, nil
 }
 
-func (r *Restore) decryptArchive(archivePath string) (string, error) {
-	tmpFile, err := osutils.CreateTempFile("dotpak-decrypt-*.tar.gz")
-	if err != nil {
-		return "", err
-	}
-	_ = tmpFile.Close()
-	outputPath := tmpFile.Name()
-
-	if strings.HasSuffix(archivePath, ".age") {
-		identityFiles, cleanup, resolveErr := ResolveAgeIdentity(r.opts.AgeIdentity, r.cfg)
-		if resolveErr != nil {
-			return "", resolveErr
-		}
-		defer cleanup()
-		return decryptWithAge(archivePath, outputPath, identityFiles)
-	}
-	if strings.HasSuffix(archivePath, ".gpg") {
-		return decryptWithGPG(archivePath, outputPath)
-	}
-
-	return "", errors.New("unknown encryption format")
-}
-
-func (r *Restore) createSafetyBackup(sourceArchive, originalArchive string) (string, error) {
-	filesToBackup, err := r.findFilesToBackup(sourceArchive)
+// createSafetyBackup archives existing files that the restore would overwrite.
+// It fails hard instead of degrading: an unreadable file or a failed
+// encryption aborts the restore, because the safety archive may hold the only
+// copy of the data about to be overwritten.
+func (r *Restore) createSafetyBackup(archivePath string) (string, error) {
+	filesToBackup, err := r.findFilesToBackup(archivePath)
 	if err != nil {
 		return "", fmt.Errorf("scanning for files to backup: %w", err)
 	}
@@ -272,8 +285,15 @@ func (r *Restore) createSafetyBackup(sourceArchive, originalArchive string) (str
 		return "", nil
 	}
 
-	// check if safety backup contains sensitive files without encryption available
-	if r.containsSensitiveFiles(filesToBackup) && !r.canEncrypt() {
+	// encrypt if the source archive was encrypted; sensitive files also get
+	// the config's encryption even when the source archive was plaintext
+	method := crypto.DetectMethod(archivePath)
+	sensitive := r.containsSensitiveFiles(filesToBackup)
+	if method == crypto.MethodNone && sensitive {
+		method = r.configEncryptionMethod()
+	}
+
+	if sensitive && method == crypto.MethodNone {
 		filesToBackup, err = r.promptForSensitiveBackup(filesToBackup)
 		if err != nil {
 			return "", err
@@ -289,97 +309,79 @@ func (r *Restore) createSafetyBackup(sourceArchive, originalArchive string) (str
 		return "", err
 	}
 
-	timestamp := time.Now().Format("20060102_150405")
+	timestamp := time.Now().Format(metadata.TimestampFormat)
 
-	// encrypt safety backup if original archive was encrypted — stream directly
-	method := crypto.DetectMethod(originalArchive)
 	if method != crypto.MethodNone {
 		enc, encErr := crypto.NewEncryptor(method, crypto.Options{
 			AgeRecipientsFile: r.cfg.Backup.AgeRecipients,
 			GPGRecipient:      r.cfg.Backup.GPGRecipient,
 		})
 		if encErr != nil {
-			r.out.Warning("Failed to create encryptor for safety backup: %v\n", encErr)
-			// fall through to unencrypted path below
-		} else {
-			encryptedPath := filepath.Join(preRestoreDir,
-				fmt.Sprintf("pre-restore-%s.tar.gz.%s", timestamp, string(method)))
-
-			pr, pw := io.Pipe()
-			errCh := make(chan error, 1)
-			go func() {
-				errCh <- r.writeSafetyArchive(pw, filesToBackup)
-				_ = pw.Close()
-			}()
-
-			if encErr = enc.EncryptReader(pr, encryptedPath); encErr != nil {
-				_ = pr.Close() // unblock the writer goroutine
-				if writeErr := <-errCh; writeErr != nil {
-					r.out.Verbose("Safety archive write also failed: %v\n", writeErr)
-				}
-				_ = os.Remove(encryptedPath)
-				r.out.Warning("Failed to encrypt safety backup: %v\n", encErr)
-				// fall through to unencrypted path below
-			} else if writeErr := <-errCh; writeErr != nil {
-				_ = os.Remove(encryptedPath)
-				return "", writeErr
-			} else {
-				return encryptedPath, nil
-			}
+			return "", fmt.Errorf("safety backup encryption unavailable: %w", encErr)
 		}
+
+		encryptedPath := filepath.Join(preRestoreDir,
+			fmt.Sprintf("pre-restore-%s.tar.gz%s", timestamp, method.Extension()))
+		if encErr = archive.EncryptStream(enc, encryptedPath, func(w io.Writer) error {
+			return r.writeSafetyArchive(w, filesToBackup)
+		}); encErr != nil {
+			return "", fmt.Errorf("encrypting safety backup: %w", encErr)
+		}
+		return encryptedPath, nil
 	}
 
-	// unencrypted path
-	archivePath := filepath.Join(preRestoreDir, fmt.Sprintf("pre-restore-%s.tar.gz", timestamp))
+	safetyPath := filepath.Join(preRestoreDir, fmt.Sprintf("pre-restore-%s.tar.gz", timestamp))
 
-	outFile, err := os.OpenFile(archivePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	outFile, err := os.OpenFile(safetyPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return "", err
 	}
-	defer outFile.Close()
-
-	if err = r.writeSafetyArchive(outFile, filesToBackup); err != nil {
-		return "", err
+	writeErr := r.writeSafetyArchive(outFile, filesToBackup)
+	if closeErr := outFile.Close(); writeErr == nil {
+		writeErr = closeErr
+	}
+	if writeErr != nil {
+		_ = os.Remove(safetyPath)
+		return "", writeErr
 	}
 
-	return archivePath, nil
+	return safetyPath, nil
 }
 
-// writeSafetyArchive writes a tar.gz stream of the given files to w.
-func (r *Restore) writeSafetyArchive(w io.Writer, filesToBackup []string) (err error) {
-	gzWriter := gzip.NewWriter(w)
-	defer func() {
-		if cerr := gzWriter.Close(); cerr != nil && err == nil {
-			err = cerr
+// writeSafetyArchive writes a tar.gz stream of the given files to w. Any file
+// that cannot be read aborts the archive rather than being skipped silently:
+// it may be the only copy of data the restore is about to overwrite.
+func (r *Restore) writeSafetyArchive(w io.Writer, filesToBackup []string) error {
+	return archive.WriteTarGz(w, func(tw *tar.Writer) error {
+		for _, relPath := range filesToBackup {
+			fullPath := filepath.Join(r.homeDir, relPath)
+			if addErr := archive.AddFileToTar(tw, fullPath, relPath); addErr != nil {
+				return fmt.Errorf("backing up %s: %w", relPath, addErr)
+			}
 		}
-	}()
-
-	tarWriter := tar.NewWriter(gzWriter)
-	defer func() {
-		if cerr := tarWriter.Close(); cerr != nil && err == nil {
-			err = cerr
-		}
-	}()
-
-	for _, relPath := range filesToBackup {
-		fullPath := filepath.Join(r.homeDir, relPath)
-		if addErr := backup.AddFileToTar(tarWriter, fullPath, relPath); addErr != nil {
-			r.out.Verbose("Failed to backup %s: %v\n", relPath, addErr)
-			continue
-		}
-	}
-
-	return nil
+		return nil
+	})
 }
 
-func (r *Restore) findFilesToBackup(sourceArchive string) ([]string, error) {
-	file, err := os.Open(sourceArchive)
+func (r *Restore) findFilesToBackup(archivePath string) ([]string, error) {
+	rc, err := openArchiveStream(archivePath, r.identityFiles)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
-	gzReader, err := gzip.NewReader(file)
+	files, scanErr := r.scanForExistingFiles(rc)
+	closeErr := rc.Close()
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return files, nil
+}
+
+func (r *Restore) scanForExistingFiles(stream io.Reader) ([]string, error) {
+	gzReader, err := gzip.NewReader(stream)
 	if err != nil {
 		return nil, err
 	}
@@ -390,7 +392,7 @@ func (r *Restore) findFilesToBackup(sourceArchive string) ([]string, error) {
 
 	for {
 		header, nextErr := tarReader.Next()
-		if nextErr == io.EOF {
+		if errors.Is(nextErr, io.EOF) {
 			break
 		}
 		if nextErr != nil {
@@ -415,26 +417,46 @@ func (r *Restore) findFilesToBackup(sourceArchive string) ([]string, error) {
 	return filesToBackup, nil
 }
 
-func (r *Restore) extractArchive(tarPath string) (int, error) {
-	file, err := os.Open(tarPath)
+func (r *Restore) extractArchive(archivePath string) (int, error) {
+	rc, err := openArchiveStream(archivePath, r.identityFiles)
 	if err != nil {
 		return 0, err
 	}
-	defer file.Close()
 
-	gzReader, err := gzip.NewReader(file)
+	count, extractErr := r.extractStream(rc)
+	closeErr := rc.Close()
+	if extractErr != nil {
+		return count, extractErr
+	}
+	if closeErr != nil {
+		// for encrypted archives a Close error means decryption failed
+		return count, closeErr
+	}
+	return count, nil
+}
+
+//nolint:gocognit // the extraction loop centralizes all per-entry safety checks
+func (r *Restore) extractStream(stream io.Reader) (int, error) {
+	gzReader, err := gzip.NewReader(stream)
 	if err != nil {
 		return 0, err
 	}
 	defer gzReader.Close()
 
+	resolvedHome, err := filepath.EvalSymlinks(r.homeDir)
+	if err != nil {
+		return 0, fmt.Errorf("resolving home directory: %w", err)
+	}
+
 	tarReader := tar.NewReader(gzReader)
 	count := 0
+	failed := 0
+	unsafeSkipped := 0
 	var totalExtracted int64
 
 	for {
 		header, nextErr := tarReader.Next()
-		if nextErr == io.EOF {
+		if errors.Is(nextErr, io.EOF) {
 			break
 		}
 		if nextErr != nil {
@@ -443,6 +465,7 @@ func (r *Restore) extractArchive(tarPath string) (int, error) {
 
 		if !isSafePath(header.Name) {
 			r.out.Warning("Skipping unsafe path: %s\n", header.Name)
+			unsafeSkipped++
 			continue
 		}
 
@@ -450,12 +473,13 @@ func (r *Restore) extractArchive(tarPath string) (int, error) {
 			continue
 		}
 
-		//nolint:gosec // g305: path validated by isSafePath() above and isPathWithinBase() below
+		//nolint:gosec // g305: path validated by isSafePath() above and ensureParentWithinHome() below
 		targetPath := filepath.Join(r.homeDir, header.Name)
 
-		// defense-in-depth: verify resolved path is within home directory
+		// defense-in-depth: verify lexical path is within home directory
 		if !isPathWithinBase(targetPath, r.homeDir) {
 			r.out.Warning("Skipping path that escapes home directory: %s\n", header.Name)
+			unsafeSkipped++
 			continue
 		}
 
@@ -465,15 +489,21 @@ func (r *Restore) extractArchive(tarPath string) (int, error) {
 			continue
 		}
 
-		if totalExtracted+header.Size > osutils.MaxExtractTotalSize {
+		if totalExtracted+header.Size > maxExtractTotalSize {
 			return count, fmt.Errorf(
 				"total extracted size exceeds limit of %s",
-				osutils.FormatSize(osutils.MaxExtractTotalSize),
+				osutils.FormatSize(maxExtractTotalSize),
 			)
 		}
 
-		if mkdirErr := os.MkdirAll(filepath.Dir(targetPath), 0755); mkdirErr != nil {
-			r.out.Warning("Failed to create directory for %s: %v\n", header.Name, mkdirErr)
+		if parentErr := ensureParentWithinHome(targetPath, resolvedHome); parentErr != nil {
+			if errors.Is(parentErr, errEscapesHome) {
+				r.out.Warning("Skipping %s: %v\n", header.Name, parentErr)
+				unsafeSkipped++
+			} else {
+				r.out.Warning("Failed to create directory for %s: %v\n", header.Name, parentErr)
+				failed++
+			}
 			continue
 		}
 
@@ -482,6 +512,7 @@ func (r *Restore) extractArchive(tarPath string) (int, error) {
 			//nolint:gosec // g115: mode is masked to valid 9-bit permission range before conversion
 			if mkdirErr := os.MkdirAll(targetPath, os.FileMode(header.Mode)&0o777); mkdirErr != nil {
 				r.out.Warning("Failed to create directory %s: %v\n", header.Name, mkdirErr)
+				failed++
 			}
 
 		case tar.TypeReg:
@@ -490,10 +521,14 @@ func (r *Restore) extractArchive(tarPath string) (int, error) {
 				tarReader,
 				targetPath,
 				os.FileMode(header.Mode)&0o777,
-				osutils.MaxExtractFileSize,
+				maxExtractFileSize,
 			); extractErr != nil {
 				r.out.Warning("Failed to extract %s: %v\n", header.Name, extractErr)
+				failed++
 				continue
+			}
+			if timeErr := os.Chtimes(targetPath, header.ModTime, header.ModTime); timeErr != nil {
+				r.out.Verbose("Cannot restore mtime for %s: %v\n", header.Name, timeErr)
 			}
 			totalExtracted += header.Size
 			count++
@@ -501,6 +536,7 @@ func (r *Restore) extractArchive(tarPath string) (int, error) {
 		case tar.TypeSymlink:
 			if !isSafePath(header.Linkname) {
 				r.out.Warning("Skipping symlink with unsafe target: %s -> %s\n", header.Name, header.Linkname)
+				unsafeSkipped++
 				continue
 			}
 			// defense-in-depth: verify resolved symlink target is within home
@@ -508,15 +544,31 @@ func (r *Restore) extractArchive(tarPath string) (int, error) {
 			resolvedTarget := filepath.Join(filepath.Dir(targetPath), header.Linkname)
 			if !isPathWithinBase(resolvedTarget, r.homeDir) {
 				r.out.Warning("Skipping symlink that escapes home: %s -> %s\n", header.Name, header.Linkname)
+				unsafeSkipped++
 				continue
 			}
 			if rmErr := os.Remove(targetPath); rmErr != nil && !os.IsNotExist(rmErr) {
 				r.out.Warning("Failed to remove existing file for symlink %s: %v\n", header.Name, rmErr)
+				failed++
+				continue
 			}
 			if linkErr := os.Symlink(header.Linkname, targetPath); linkErr != nil {
 				r.out.Warning("Failed to create symlink %s: %v\n", header.Name, linkErr)
+				failed++
+				continue
 			}
+			count++
+
+		default:
+			r.out.Verbose("Skipping unsupported entry type %c: %s\n", header.Typeflag, header.Name)
 		}
+	}
+
+	if unsafeSkipped > 0 {
+		r.out.Warning("Skipped %d entries that would escape the home directory\n", unsafeSkipped)
+	}
+	if failed > 0 {
+		return count, fmt.Errorf("failed to restore %d of %d files", failed, failed+count)
 	}
 
 	return count, nil
@@ -545,7 +597,7 @@ func (r *Restore) matchesCategory(path string) bool {
 
 func isSafePath(path string) bool {
 	if path == "" {
-		return true
+		return false
 	}
 	// check for null bytes (can be used to bypass string checks)
 	if strings.ContainsRune(path, '\x00') {
@@ -570,8 +622,9 @@ func isSafePath(path string) bool {
 	return true
 }
 
-// isPathWithinBase validates that targetPath is within baseDir after resolution.
-// This provides defense-in-depth against path traversal attacks.
+// isPathWithinBase validates that targetPath is lexically within baseDir.
+// This provides defense-in-depth against path traversal attacks; symlinked
+// path components are handled separately by ensureParentWithinHome.
 func isPathWithinBase(targetPath, baseDir string) bool {
 	absTarget, err := filepath.Abs(targetPath)
 	if err != nil {
@@ -585,12 +638,76 @@ func isPathWithinBase(targetPath, baseDir string) bool {
 	return strings.HasPrefix(absTarget, absBase+string(filepath.Separator)) || absTarget == absBase
 }
 
-func extractFile(r io.Reader, path string, mode os.FileMode, maxSize int64) error {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+// errEscapesHome marks entries whose real (symlink-resolved) location falls
+// outside the home directory.
+var errEscapesHome = errors.New("path escapes home directory after resolving symlinks")
+
+// ensureParentWithinHome creates the parent directory of targetPath (0700 —
+// dotfiles are private by default, and restored ~/.ssh or ~/.gnupg must not be
+// world-readable) and verifies that no symlinked component redirects the write
+// outside the home directory.
+func ensureParentWithinHome(targetPath, resolvedHome string) error {
+	parent := filepath.Dir(targetPath)
+
+	// resolve the deepest existing ancestor BEFORE creating anything, so
+	// MkdirAll cannot create directories through an escaping symlink
+	existing := parent
+	for {
+		if _, err := os.Lstat(existing); err == nil {
+			break
+		}
+		next := filepath.Dir(existing)
+		if next == existing {
+			break
+		}
+		existing = next
+	}
+	resolvedExisting, err := filepath.EvalSymlinks(existing)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	if !isPathWithinBase(resolvedExisting, resolvedHome) {
+		return errEscapesHome
+	}
+
+	if err = os.MkdirAll(parent, 0700); err != nil {
+		return err
+	}
+
+	// re-resolve the full parent: components that already existed may
+	// themselves be symlinks
+	resolvedParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return err
+	}
+	if !isPathWithinBase(resolvedParent, resolvedHome) {
+		return errEscapesHome
+	}
+	return nil
+}
+
+func extractFile(r io.Reader, path string, mode os.FileMode, maxSize int64) (err error) {
+	// remove any existing file first: O_EXCL then guarantees the write never
+	// follows a pre-existing symlink at the target, and re-creating applies
+	// the archive's mode to previously existing files too
+	if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+		return rmErr
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := file.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+
+	// the OpenFile mode is masked by the umask; Chmod applies it exactly
+	if err = file.Chmod(mode); err != nil {
+		return err
+	}
 
 	limitedReader := io.LimitReader(r, maxSize)
 	written, err := io.Copy(file, limitedReader)
@@ -610,44 +727,27 @@ func extractFile(r io.Reader, path string, mode os.FileMode, maxSize int64) erro
 
 // ListArchiveContents lists the contents of an archive.
 func ListArchiveContents(cfg *config.Config, archivePath, ageIdentity string, out *output.Output) error {
-	tarPath := archivePath
-
-	if strings.HasSuffix(archivePath, ".age") || strings.HasSuffix(archivePath, ".gpg") {
-		tmpFile, err := osutils.CreateTempFile("dotpak-list-*.tar.gz")
-		if err != nil {
-			return err
-		}
-		_ = tmpFile.Close()
-		defer os.Remove(tmpFile.Name())
-
-		var decrypted string
-		var decryptErr error
-
-		if strings.HasSuffix(archivePath, ".age") {
-			identityFiles, cleanup, resolveErr := ResolveAgeIdentity(ageIdentity, cfg)
-			if resolveErr != nil {
-				return resolveErr
-			}
-			defer cleanup()
-			decrypted, decryptErr = decryptWithAge(archivePath, tmpFile.Name(), identityFiles)
-		} else {
-			decrypted, decryptErr = decryptWithGPG(archivePath, tmpFile.Name())
-		}
-
-		if decryptErr != nil {
-			return decryptErr
-		}
-		tarPath = decrypted
-		defer os.Remove(tarPath)
-	}
-
-	file, err := os.Open(tarPath)
+	identityFiles, cleanup, err := resolveAgeIdentityFor(archivePath, ageIdentity, cfg)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer cleanup()
 
-	gzReader, err := gzip.NewReader(file)
+	rc, err := openArchiveStream(archivePath, identityFiles)
+	if err != nil {
+		return err
+	}
+
+	listErr := listContents(rc, out)
+	closeErr := rc.Close()
+	if listErr != nil {
+		return listErr
+	}
+	return closeErr
+}
+
+func listContents(stream io.Reader, out *output.Output) error {
+	gzReader, err := gzip.NewReader(stream)
 	if err != nil {
 		return err
 	}
@@ -659,15 +759,14 @@ func ListArchiveContents(cfg *config.Config, archivePath, ageIdentity string, ou
 
 	for {
 		header, nextErr := tarReader.Next()
-		if nextErr == io.EOF {
+		if errors.Is(nextErr, io.EOF) {
 			break
 		}
 		if nextErr != nil {
 			return nextErr
 		}
 
-		size := formatSize(header.Size)
-		out.Print("  %-50s %10s\n", header.Name, size)
+		out.Print("  %-50s %10s\n", header.Name, osutils.FormatSize(header.Size))
 	}
 
 	return nil
@@ -679,50 +778,36 @@ type fileContent struct {
 	archive string // content from archive
 }
 
+// maxDiffContentSize limits how much file content is read for comparison.
+const maxDiffContentSize = 10 * 1024 * 1024
+
 // ShowDiff shows differences between archive and current files.
 func ShowDiff(cfg *config.Config, archivePath, ageIdentity string, verbose bool, out *output.Output) error {
 	home, err := osutils.HomeDir()
 	if err != nil {
 		return err
 	}
-	tarPath := archivePath
-
-	if strings.HasSuffix(archivePath, ".age") || strings.HasSuffix(archivePath, ".gpg") {
-		tmpFile, tmpErr := osutils.CreateTempFile("dotpak-diff-*.tar.gz")
-		if tmpErr != nil {
-			return tmpErr
-		}
-		_ = tmpFile.Close()
-		defer os.Remove(tmpFile.Name())
-
-		var decrypted string
-		var decryptErr error
-
-		if strings.HasSuffix(archivePath, ".age") {
-			identityFiles, cleanup, resolveErr := ResolveAgeIdentity(ageIdentity, cfg)
-			if resolveErr != nil {
-				return resolveErr
-			}
-			defer cleanup()
-			decrypted, decryptErr = decryptWithAge(archivePath, tmpFile.Name(), identityFiles)
-		} else {
-			decrypted, decryptErr = decryptWithGPG(archivePath, tmpFile.Name())
-		}
-
-		if decryptErr != nil {
-			return decryptErr
-		}
-		tarPath = decrypted
-		defer os.Remove(tarPath)
-	}
-
-	file, err := os.Open(tarPath)
+	identityFiles, cleanup, err := resolveAgeIdentityFor(archivePath, ageIdentity, cfg)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer cleanup()
 
-	gzReader, err := gzip.NewReader(file)
+	rc, err := openArchiveStream(archivePath, identityFiles)
+	if err != nil {
+		return err
+	}
+
+	diffErr := showDiffStream(rc, home, verbose, out)
+	closeErr := rc.Close()
+	if diffErr != nil {
+		return diffErr
+	}
+	return closeErr
+}
+
+func showDiffStream(stream io.Reader, home string, verbose bool, out *output.Output) error {
+	gzReader, err := gzip.NewReader(stream)
 	if err != nil {
 		return err
 	}
@@ -762,7 +847,7 @@ func ShowDiff(cfg *config.Config, archivePath, ageIdentity string, verbose bool,
 
 		// read archive content to compare
 		var archiveContent []byte
-		if header.Size < 10*1024*1024 { // limit to 10MB
+		if header.Size < maxDiffContentSize {
 			archiveContent, _ = io.ReadAll(io.LimitReader(tarReader, header.Size))
 		}
 
@@ -876,8 +961,4 @@ func showFileDiff(home string, fc fileContent, out *output.Output) {
 		}
 		shown++
 	}
-}
-
-func formatSize(size int64) string {
-	return osutils.FormatSize(size)
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -18,7 +19,6 @@ import (
 type testSetup struct {
 	homeDir   string
 	backupDir string
-	cleanup   func()
 }
 
 func setupTest(t *testing.T) *testSetup {
@@ -38,7 +38,6 @@ func setupTest(t *testing.T) *testSetup {
 	return &testSetup{
 		homeDir:   homeDir,
 		backupDir: backupDir,
-		cleanup:   func() {}, // t.TempDir() handles cleanup
 	}
 }
 
@@ -60,7 +59,10 @@ func TestNew(t *testing.T) {
 	opts := &Options{}
 	out := output.New(output.ModeQuiet, false)
 
-	b := New(cfg, opts, out)
+	b, err := New(cfg, opts, out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if b == nil {
 		t.Fatal("expected non-nil backup instance")
@@ -297,33 +299,6 @@ func TestCollectFiles(t *testing.T) {
 	})
 }
 
-func TestFormatSize(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		size     int64
-		expected string
-	}{
-		{0, "0 bytes"},
-		{100, "100 bytes"},
-		{1023, "1023 bytes"},
-		{1024, "1.00 KB"},
-		{1536, "1.50 KB"},
-		{1024 * 1024, "1.00 MB"},
-		{1024 * 1024 * 1024, "1.00 GB"},
-		{1024*1024*1024 + 512*1024*1024, "1.50 GB"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.expected, func(t *testing.T) {
-			result := formatSize(tt.size)
-			if result != tt.expected {
-				t.Errorf("formatSize(%d) = %s, want %s", tt.size, result, tt.expected)
-			}
-		})
-	}
-}
-
 func TestCreateArchive(t *testing.T) {
 	t.Parallel()
 
@@ -366,6 +341,11 @@ func TestCreateArchive(t *testing.T) {
 
 	if _, err := os.Stat(archivePath); err != nil {
 		t.Fatalf("archive not created: %v", err)
+	}
+
+	// the temporary file used for the atomic rename must be gone
+	if _, err := os.Stat(archivePath + partialSuffix); !os.IsNotExist(err) {
+		t.Errorf("expected no leftover partial file, stat err: %v", err)
 	}
 
 	f, err := os.Open(archivePath)
@@ -702,72 +682,50 @@ func TestCleanupOldBackups_DisabledWhenZero(t *testing.T) {
 	}
 }
 
-func TestFileInfo(t *testing.T) {
+func TestCollectItem_SkipsFIFO(t *testing.T) {
 	t.Parallel()
 
-	now := time.Now()
-	info := FileInfo{
-		FullPath:  "/home/user/.zshrc",
-		RelPath:   ".zshrc",
-		Size:      1024,
-		ModTime:   now,
-		Sensitive: true,
+	setup := setupTest(t)
+
+	fifoPath := filepath.Join(setup.homeDir, ".config", "app.fifo")
+	if err := os.MkdirAll(filepath.Dir(fifoPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(fifoPath, 0600); err != nil {
+		t.Skipf("cannot create FIFO: %v", err)
+	}
+	createTestFile(t, filepath.Join(setup.homeDir, ".config", "app.conf"), "key=value")
+
+	b := &Backup{
+		cfg:     &config.Config{},
+		homeDir: setup.homeDir,
+		out:     output.New(output.ModeQuiet, false),
 	}
 
-	if info.FullPath != "/home/user/.zshrc" {
-		t.Errorf("unexpected full path: %s", info.FullPath)
-	}
-	if info.RelPath != ".zshrc" {
-		t.Errorf("unexpected rel path: %s", info.RelPath)
-	}
-	if info.Size != 1024 {
-		t.Errorf("unexpected size: %d", info.Size)
-	}
-	if !info.Sensitive {
-		t.Error("expected sensitive to be true")
-	}
-}
+	t.Run("fifo as direct item is skipped", func(t *testing.T) {
+		files, err := b.collectItem(".config/app.fifo")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(files) != 0 {
+			t.Errorf("expected FIFO to be skipped, got %d files", len(files))
+		}
+	})
 
-func TestOptions(t *testing.T) {
-	t.Parallel()
-
-	opts := &Options{
-		DryRun:           true,
-		EncryptionMethod: "age",
-		IncludeSecrets:   true,
-		RecipientsFile:   "/path/to/recipients",
-		GPGRecipient:     "user@example.com",
-		Estimate:         true,
-	}
-
-	if !opts.DryRun {
-		t.Error("expected DryRun to be true")
-	}
-	if opts.EncryptionMethod != "age" {
-		t.Errorf("expected age, got %s", opts.EncryptionMethod)
-	}
-	if !opts.IncludeSecrets {
-		t.Error("expected IncludeSecrets to be true")
-	}
-	if opts.RecipientsFile != "/path/to/recipients" {
-		t.Errorf("unexpected recipients file: %s", opts.RecipientsFile)
-	}
-	if opts.GPGRecipient != "user@example.com" {
-		t.Errorf("unexpected GPG recipient: %s", opts.GPGRecipient)
-	}
-	if !opts.Estimate {
-		t.Error("expected Estimate to be true")
-	}
-}
-
-func TestHasAge(t *testing.T) {
-	t.Parallel()
-	_ = HasAge()
-}
-
-func TestHasGPG(t *testing.T) {
-	t.Parallel()
-	_ = HasGPG()
+	t.Run("fifo inside walked directory is skipped", func(t *testing.T) {
+		files, err := b.collectItem(".config")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		for _, f := range files {
+			if strings.HasSuffix(f.RelPath, ".fifo") {
+				t.Errorf("expected FIFO to be skipped in walk, found %s", f.RelPath)
+			}
+		}
+		if len(files) != 1 {
+			t.Errorf("expected only the regular file, got %d", len(files))
+		}
+	})
 }
 
 func TestCollectItem_Symlinks(t *testing.T) {
@@ -907,8 +865,10 @@ type failEncryptor struct{}
 func (f *failEncryptor) EncryptReader(_ io.Reader, _ string) error {
 	return errors.New("mock encrypt failure")
 }
-func (f *failEncryptor) Decrypt(_, _ string) error { return nil }
-func (f *failEncryptor) Available() bool           { return true }
+func (f *failEncryptor) DecryptReader(_ string) (io.ReadCloser, error) {
+	return nil, errors.New("mock decrypt failure")
+}
+func (f *failEncryptor) Available() bool { return true }
 
 func TestRunCommand(t *testing.T) {
 	t.Parallel()

@@ -77,23 +77,6 @@ func TestPrint(t *testing.T) {
 	})
 }
 
-func TestPrintln(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	out := New(ModeNormal, false)
-	out.SetWriter(&buf)
-
-	out.Println("Test", "message")
-
-	if !strings.Contains(buf.String(), "Test message") {
-		t.Errorf("expected 'Test message', got %q", buf.String())
-	}
-	if !strings.HasSuffix(buf.String(), "\n") {
-		t.Error("expected newline at end")
-	}
-}
-
 func TestVerbose(t *testing.T) {
 	t.Parallel()
 
@@ -180,29 +163,32 @@ func TestError(t *testing.T) {
 func TestWarning(t *testing.T) {
 	t.Parallel()
 
-	t.Run("warning shows in normal mode", func(t *testing.T) {
-		var buf bytes.Buffer
-		out := New(ModeNormal, false)
-		out.SetWriter(&buf)
+	// warnings signal degraded behavior, so they go to stderr in every mode
+	for _, mode := range []Mode{ModeNormal, ModeQuiet, ModeJSON} {
+		var errBuf, outBuf bytes.Buffer
+		out := New(mode, false)
+		out.SetWriter(&outBuf)
+		out.SetErrWriter(&errBuf)
 
 		out.Warning("Proceed with caution")
 
-		if !strings.Contains(buf.String(), "Warning:") {
-			t.Error("expected 'Warning:' prefix")
+		if !strings.Contains(errBuf.String(), "Warning:") {
+			t.Errorf("mode %v: expected 'Warning:' on stderr, got %q", mode, errBuf.String())
 		}
-	})
-
-	t.Run("warning suppressed in quiet mode", func(t *testing.T) {
-		var buf bytes.Buffer
-		out := New(ModeQuiet, false)
-		out.SetWriter(&buf)
-
-		out.Warning("This should not appear")
-
-		if buf.Len() != 0 {
-			t.Errorf("expected no warning in quiet mode, got %q", buf.String())
+		if outBuf.Len() != 0 {
+			t.Errorf("mode %v: warning must not pollute stdout, got %q", mode, outBuf.String())
 		}
-	})
+	}
+}
+
+func TestMode(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []Mode{ModeNormal, ModeQuiet, ModeJSON} {
+		if got := New(mode, false).Mode(); got != mode {
+			t.Errorf("Mode() = %v, want %v", got, mode)
+		}
+	}
 }
 
 func TestSuccess(t *testing.T) {
@@ -216,20 +202,6 @@ func TestSuccess(t *testing.T) {
 
 	if !strings.Contains(buf.String(), "Operation completed!") {
 		t.Errorf("expected success message, got %q", buf.String())
-	}
-}
-
-func TestInfo(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	out := New(ModeNormal, false)
-	out.SetWriter(&buf)
-
-	out.Info("FYI: %d files", 10)
-
-	if !strings.Contains(buf.String(), "FYI: 10 files") {
-		t.Errorf("expected info message, got %q", buf.String())
 	}
 }
 
@@ -347,28 +319,6 @@ func TestJSON(t *testing.T) {
 			t.Error("expected indented JSON")
 		}
 	})
-}
-
-func TestJSONCompact(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	out := New(ModeJSON, false)
-	out.SetWriter(&buf)
-
-	data := map[string]string{"key": "value"}
-	_ = out.JSONCompact(data)
-
-	// should not have indentation
-	if strings.Contains(buf.String(), "  ") {
-		t.Error("expected compact JSON without indentation")
-	}
-
-	// should still be valid JSON
-	var parsed map[string]any
-	if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
-		t.Errorf("output is not valid JSON: %v", err)
-	}
 }
 
 func TestDiffOutput(t *testing.T) {
