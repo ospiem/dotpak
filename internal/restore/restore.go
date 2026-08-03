@@ -370,12 +370,8 @@ func (r *Restore) findFilesToBackup(archivePath string) ([]string, error) {
 	}
 
 	files, scanErr := r.scanForExistingFiles(rc)
-	closeErr := rc.Close()
-	if scanErr != nil {
-		return nil, scanErr
-	}
-	if closeErr != nil {
-		return nil, closeErr
+	if err = closeArchiveStream(rc, scanErr); err != nil {
+		return nil, err
 	}
 	return files, nil
 }
@@ -424,15 +420,7 @@ func (r *Restore) extractArchive(archivePath string) (int, error) {
 	}
 
 	count, extractErr := r.extractStream(rc)
-	closeErr := rc.Close()
-	if extractErr != nil {
-		return count, extractErr
-	}
-	if closeErr != nil {
-		// for encrypted archives a Close error means decryption failed
-		return count, closeErr
-	}
-	return count, nil
+	return count, closeArchiveStream(rc, extractErr)
 }
 
 //nolint:gocognit // the extraction loop centralizes all per-entry safety checks
@@ -739,11 +727,7 @@ func ListArchiveContents(cfg *config.Config, archivePath, ageIdentity string, ou
 	}
 
 	listErr := listContents(rc, out)
-	closeErr := rc.Close()
-	if listErr != nil {
-		return listErr
-	}
-	return closeErr
+	return closeArchiveStream(rc, listErr)
 }
 
 func listContents(stream io.Reader, out *output.Output) error {
@@ -799,11 +783,7 @@ func ShowDiff(cfg *config.Config, archivePath, ageIdentity string, verbose bool,
 	}
 
 	diffErr := showDiffStream(rc, home, verbose, out)
-	closeErr := rc.Close()
-	if diffErr != nil {
-		return diffErr
-	}
-	return closeErr
+	return closeArchiveStream(rc, diffErr)
 }
 
 func showDiffStream(stream io.Reader, home string, verbose bool, out *output.Output) error {

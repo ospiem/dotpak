@@ -205,7 +205,7 @@ func Load(path string) (*Config, error) {
 
 	// decode over defaults: keys present in the file replace the default value
 	// (including whole arrays like items), omitted keys keep their defaults.
-	// This also means max_backups = 0 is honored as "keep all" instead of
+	// this also means max_backups = 0 is honored as "keep all" instead of
 	// being silently coerced back to the default.
 	cfg := DefaultConfig()
 
@@ -221,7 +221,7 @@ func Load(path string) (*Config, error) {
 	cfg.Backup.AgeRecipients = osutils.ExpandPath(cfg.Backup.AgeRecipients)
 	cfg.Backup.AgeIdentityFiles = expandPaths(cfg.Backup.AgeIdentityFiles)
 
-	// Items and Sensitive are consumed as paths relative to $HOME by backup/restore,
+	// items and Sensitive are consumed as paths relative to $HOME by backup/restore,
 	// so normalize any ~/ or absolute-under-$HOME forms back to home-relative.
 	home, _ := osutils.HomeDir()
 	for i, item := range cfg.Items {

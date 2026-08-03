@@ -113,7 +113,7 @@ func AddFileToTar(tw *tar.Writer, fullPath, relPath string) error {
 		return fmt.Errorf("adding %s: %w", relPath, err)
 	}
 
-	// A file that shrank between Lstat and read would otherwise leave the tar
+	// a file that shrank between Lstat and read would otherwise leave the tar
 	// stream short, poisoning every subsequent WriteHeader. Pad the entry to
 	// the declared size so the archive stays consistent, and report the file.
 	if written < header.Size {

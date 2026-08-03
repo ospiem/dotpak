@@ -306,6 +306,63 @@ age_identity_files = ["` + filepath.Join(configAgeDir, "keys.txt") + `"]
 	}
 }
 
+// TestWrongAgeIdentityReportsDecryption guards the decryption verdict: reading
+// a stream age never filled fails with a bare "EOF", which must not replace the
+// real reason reported when the decryption process is reaped.
+func TestWrongAgeIdentityReportsDecryption(t *testing.T) {
+	skipIfShort(t)
+	t.Parallel()
+
+	if _, err := exec.LookPath("age"); err != nil {
+		t.Skip("age not available")
+	}
+	if _, err := exec.LookPath("age-keygen"); err != nil {
+		t.Skip("age-keygen not available")
+	}
+
+	env := setupTestEnv(t)
+	env.createMockDotfiles(t)
+
+	_, recipientsFile := generateAgeKeys(t, env.homeDir)
+
+	config := `
+items = [".zshrc"]
+
+[backup]
+backup_dir = "` + env.backupDir + `"
+encryption = "age"
+age_recipients = "` + recipientsFile + `"
+`
+	env.writeConfig(t, config)
+
+	backupResult := env.runBackup(t)
+	if !backupResult.Success {
+		t.Fatalf("Backup failed: %s", backupResult.Error)
+	}
+
+	// an identity that cannot open the archive
+	wrongKeys := filepath.Join(t.TempDir(), "wrong.txt")
+	if err := exec.Command("age-keygen", "-o", wrongKeys).Run(); err != nil {
+		t.Fatalf("Failed to generate wrong age key: %v", err)
+	}
+
+	cmd := exec.Command(env.binary, "contents", "--age-identity", wrongKeys,
+		"--config", env.configFile, backupResult.Archive)
+	cmd.Env = append(os.Environ(), "HOME="+env.homeDir)
+
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("Expected contents to fail with a wrong identity, got:\n%s", out)
+	}
+
+	if !strings.Contains(string(out), "age decryption failed") {
+		t.Errorf("Expected the age failure to be reported, got:\n%s", out)
+	}
+	if strings.TrimSpace(string(out)) == "Error: EOF" {
+		t.Errorf("Decryption verdict was masked by the stream read error:\n%s", out)
+	}
+}
+
 func generateAgeKeys(t *testing.T, homeDir string) (keysFile, recipientsFile string) {
 	t.Helper()
 
