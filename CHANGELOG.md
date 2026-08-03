@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-03
+
+### Security
+
+- **Extraction containment**: entry parents are resolved with `EvalSymlinks` before writing and files are opened with remove-then-`O_EXCL`, so a crafted archive can no longer escape `$HOME` or write through a pre-existing symlink
+- **Private by default**: restored parent directories are created 0700 and files are chmod'ed to the exact archive mode, so a restored `~/.ssh` or `~/.gnupg` is never world-readable
+- **Safety backup is mandatory**: failing to create the pre-restore archive aborts the restore instead of continuing (`--no-backup` opts out); sensitive files are never silently written unencrypted — interactive prompt in normal mode, hard error under `--json`/`--quiet`
+- **Streaming decryption**: decrypted archives no longer land in a temp file on the restore, diff, and contents paths
+- **Decompression limits**: 1GB per entry and 10GB per archive
+
+### Changed
+
+- **BREAKING**: `restore` with `--json` or `--quiet` requires `--force` — it used to overwrite existing files without any confirmation
+- `restore --age-identity -` requires `--force` (or `--dry-run`): the identity arrives on stdin, so the confirmation prompt would consume the piped key
+- Warnings go to stderr in every mode, keeping them visible under `--quiet`/`--json` without corrupting JSON on stdout
+- Config files are decoded over the defaults: omitted keys keep their default, and `max_backups = 0` now means "keep all" instead of falling back to the default
+- Errors are reported exactly once (cobra's duplicate error and usage output is silenced)
+- `internal/schedule` (launchd/crontab) and `internal/pkgrestore` (brew/apt/go) split out of `main.go`; tar and encryption plumbing shared via `internal/archive`
+
+### Fixed
+
+- FIFOs, sockets, and devices are skipped during backup — opening a FIFO with no writer blocked scheduled backups forever
+- Archives are written to a `.partial` sibling and renamed into place, so an interrupted backup leaves no truncated file
+- Item paths written as `~/…`, `$HOME/…`, or absolute under home are normalized instead of breaking the build
+- A failed decryption reports the tool's verdict (`age: no identity matched…`) instead of a bare `EOF` from the emptied stream
+- GPG decryption uses `--batch`, so it no longer hangs on an overwrite prompt in cron context
+- Missing binaries and non-zero exits from `age`/`gpg` keep the underlying error and captured stderr
+- Backup no longer reports success when the archive could not be written; per-file failures are counted honestly
+
 ## [0.3.0] - 2026-03-22
 
 ### Added
