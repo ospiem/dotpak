@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **Verify before overwrite**: `restore --no-backup` streams the whole decrypted archive first, so a truncated or tampered age/gpg archive is rejected before any file is touched (it used to overwrite files, then fail)
+- **Sensitive means configured**: the safety backup now treats everything in `sensitive` (plus a built-in floor) as sensitive, not a fixed 9-entry list — shell history, `.claude.json`, `.codex/auth.json` and user-configured items no longer land in a plaintext `pre-restore` archive silently
+- `diff` validates archive entry names like `restore` does, so a crafted archive can no longer make it read files outside `$HOME`
+- Encrypted archives are created 0600 (age/gpg's `-o`/`--output` created them with the umask default)
+
+### Changed
+
+- **Default excludes** no longer contain `*.md`, `*.sh`, `docs`, `test`, `tests`: matched per path component, they silently dropped the contents of `.codex/skills` and `.claude/projects`. Re-add them in `[excludes]` if you relied on them
+- A `--config` path that does not exist is an error instead of a silent fallback to the default configuration (a scheduled backup pointed at a renamed config kept writing plaintext default backups)
+- Unknown config keys (`max_backup`, `[backups]`, …) produce a warning on load and are reported by `config validate`
+- Restoring an encrypted archive on a machine with no recipients configured no longer aborts: the safety backup falls back to the sensitive-files prompt (or plaintext with a warning when nothing sensitive is involved)
+- Linux cron entry: `PATH` is set inside the command instead of a crontab environment line (comments are not allowed there, so `# dotpak` had become part of `PATH`); reinstall with `dotpak cron install`
+- A file that grows while being read (shell history) is archived with its original size and reported as a warning instead of being counted as skipped
+- `cron run` writes its warnings to the backup log instead of stderr, which launchd discards
+
+### Fixed
+
+- Symlinks whose target is absolute or climbs with `..` but stays inside `$HOME` (stow/chezmoi setups) are restored instead of being silently skipped; every created link is re-checked physically after extraction, so a chain of archive symlinks cannot plant a link that resolves outside `$HOME`
+- `--age-identity` given a one-shot source (process substitution, FIFO) is staged once and reused, so restores that decrypt the archive twice no longer fail on the second pass
+- `cron install --config <path>` fails when the file does not exist instead of installing a job that fails every run
+- `[host.*]`/`[profile.*]` items written as `~/…`, `$HOME/…` or absolute under home are normalized like top-level items
+- `age_identity_files` is honored as a list: every existing identity is passed to `age -d`, so archives encrypted for a newer key decrypt
+- A relative `--config` given to `cron install` is made absolute before being written to the plist/crontab
+- `%` in paths is escaped in the crontab command (cron turns it into a newline)
+- `brew bundle dump` no longer passes `--describe`, which Homebrew 7 rejects — the Brewfile manifest was silently not written
+- Package-manifest commands (`brew`, `mas`, `apt-mark`, `go`) time out after 2 minutes instead of hanging the backup; `go version -m` runs once per directory
+- An abandoned `.partial` archive no longer counts toward `max_backups` (it could push a real backup out of the retention window); stale ones are removed
+- Errors raised before a command handler runs (unknown command or flag, missing argument) are reported — also as a `--json` envelope — instead of a silent exit 1
+
 ## [0.4.0] - 2026-08-03
 
 ### Security
