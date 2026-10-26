@@ -123,8 +123,8 @@ func New(cfg *config.Config, opts *Options, out *output.Output) (*Restore, error
 // builtinSensitivePrefixes is the floor of what counts as sensitive even when
 // the config trimmed its sensitive list.
 var builtinSensitivePrefixes = []string{
-	".ssh", ".gnupg", ".aws", ".config/gcloud", ".azure",
-	".kube", ".terraform", ".terraformrc", ".docker", ".pypirc",
+	".ssh", ".gnupg", ".aws", ".config/gcloud", ".azure", ".kube",
+	".terraform", ".terraform.d", ".terraformrc", ".docker", ".dockercfg", ".pypirc",
 }
 
 // sensitivePrefixes returns the home-relative prefixes marking a file as
@@ -511,6 +511,7 @@ func (r *Restore) extractStream(stream io.Reader) (int, error) {
 	failed := 0
 	unsafeSkipped := 0
 	var totalExtracted int64
+	var links []createdLink
 
 	for {
 		header, nextErr := tarReader.Next()
@@ -609,12 +610,18 @@ func (r *Restore) extractStream(stream io.Reader) (int, error) {
 				failed++
 				continue
 			}
+			links = append(links, createdLink{name: header.Name, path: targetPath, linkname: header.Linkname})
 			count++
 
 		default:
 			r.out.Verbose("Skipping unsupported entry type %c: %s\n", header.Typeflag, header.Name)
 		}
 	}
+
+	removed, removeFailed := r.removeEscapingLinks(links, resolvedHome)
+	unsafeSkipped += removed
+	count -= removed
+	failed += removeFailed
 
 	if unsafeSkipped > 0 {
 		r.out.Warning("Skipped %d entries that would escape the home directory\n", unsafeSkipped)
@@ -624,6 +631,34 @@ func (r *Restore) extractStream(stream io.Reader) (int, error) {
 	}
 
 	return count, nil
+}
+
+// createdLink records a symlink written by this run for the post-extraction
+// physical containment check.
+type createdLink struct {
+	name     string
+	path     string
+	linkname string
+}
+
+// removeEscapingLinks re-checks every link physically now that all of them
+// exist: the lexical check at creation cannot see through symlinks the
+// archive itself created (".x/s -> .." turns ".x/s/../outside" into a path
+// above home), and entry order lets a later link redirect an earlier one. It
+// returns how many links were removed and how many removals failed.
+func (r *Restore) removeEscapingLinks(links []createdLink, resolvedHome string) (removed, failed int) {
+	for _, link := range links {
+		if physicalTargetWithinHome(link.path, link.linkname, resolvedHome) {
+			continue
+		}
+		r.out.Warning("Removing symlink that resolves outside home: %s -> %s\n", link.name, link.linkname)
+		if rmErr := os.Remove(link.path); rmErr != nil && !os.IsNotExist(rmErr) {
+			r.out.Warning("Failed to remove symlink %s: %v\n", link.name, rmErr)
+			failed++
+		}
+		removed++
+	}
+	return removed, failed
 }
 
 func (r *Restore) matchesCategory(path string) bool {
@@ -679,10 +714,9 @@ func isSafePath(path string) bool {
 // resolvedHome are both accepted because an absolute target may spell either
 // form (/var/... vs /private/var/... on macOS).
 //
-// A lexical check is sufficient here: creating the link writes nothing at the
-// target, and every later write resolves its parent directories with
-// EvalSymlinks (ensureParentWithinHome), so a link cannot redirect extraction
-// outside home even if it passes through another symlink.
+// This is the cheap first gate; physicalTargetWithinHome re-checks every
+// created link after extraction, when links the archive itself created can
+// be followed.
 func symlinkTargetWithinHome(linkPath, linkname, home, resolvedHome string) bool {
 	if linkname == "" || strings.ContainsRune(linkname, '\x00') {
 		return false
@@ -693,6 +727,53 @@ func symlinkTargetWithinHome(linkPath, linkname, home, resolvedHome string) bool
 	}
 	target = filepath.Clean(target)
 	return isPathWithinBase(target, home) || isPathWithinBase(target, resolvedHome)
+}
+
+// physicalTargetWithinHome reports whether the symlink at linkPath, once every
+// component of its target is followed on disk, lands inside resolvedHome.
+// Unlike [filepath.Clean] it does not collapse "x/.." without looking at x.
+func physicalTargetWithinHome(linkPath, linkname, resolvedHome string) bool {
+	target, err := resolveLinkTarget(linkPath, linkname)
+	if err != nil {
+		return false
+	}
+	return isPathWithinBase(target, resolvedHome)
+}
+
+// resolveLinkTarget walks linkname component by component from the link's
+// (physically resolved) directory, following symlinks that exist and keeping
+// not-yet-existing components lexically.
+func resolveLinkTarget(linkPath, linkname string) (string, error) {
+	current := string(filepath.Separator)
+	if !filepath.IsAbs(linkname) {
+		parent, err := filepath.EvalSymlinks(filepath.Dir(linkPath))
+		if err != nil {
+			return "", err
+		}
+		current = parent
+	}
+
+	for component := range strings.SplitSeq(filepath.ToSlash(linkname), "/") {
+		switch component {
+		case "", ".":
+			continue
+		case "..":
+			current = filepath.Dir(current)
+		default:
+			next := filepath.Join(current, component)
+			resolved, err := filepath.EvalSymlinks(next)
+			switch {
+			case err == nil:
+				current = resolved
+			case os.IsNotExist(err):
+				current = next
+			default:
+				// loops, permission problems: not something to trust
+				return "", err
+			}
+		}
+	}
+	return current, nil
 }
 
 // isPathWithinBase validates that targetPath is lexically within baseDir.

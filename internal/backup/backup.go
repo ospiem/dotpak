@@ -484,17 +484,29 @@ func (b *Backup) cleanupOldBackups() {
 	}
 	sort.Strings(timestamps)
 
+	// metadata whose archive is gone (deleted by hand, or a partially failed
+	// cleanup) is useless on its own and would otherwise pile up forever
+	for ts, paths := range groups {
+		if !completed[ts] {
+			b.removeBackupFiles(paths, "orphaned metadata")
+		}
+	}
+
 	toRemove := len(timestamps) - b.cfg.Backup.MaxBackups
 	if toRemove <= 0 {
 		return
 	}
 
 	for _, ts := range timestamps[:toRemove] {
-		for _, path := range groups[ts] {
-			b.out.Verbose("Removing old backup: %s\n", filepath.Base(path))
-			if rmErr := os.Remove(path); rmErr != nil {
-				b.out.Verbose("Failed to remove old backup %s: %v\n", filepath.Base(path), rmErr)
-			}
+		b.removeBackupFiles(groups[ts], "old backup")
+	}
+}
+
+func (b *Backup) removeBackupFiles(paths []string, what string) {
+	for _, path := range paths {
+		b.out.Verbose("Removing %s: %s\n", what, filepath.Base(path))
+		if rmErr := os.Remove(path); rmErr != nil {
+			b.out.Verbose("Failed to remove %s %s: %v\n", what, filepath.Base(path), rmErr)
 		}
 	}
 }
@@ -518,7 +530,31 @@ func (b *Backup) backupHomebrew() {
 		b.out.Verbose("Homebrew backup failed: %v\n", err)
 		return
 	}
+
+	// recent Homebrew dumps go "..." entries; they are restored from
+	// go-packages.txt, and brew bundle install would go install them again
+	content, err := os.ReadFile(brewfile)
+	if err != nil {
+		b.out.Verbose("Failed to read Brewfile: %v\n", err)
+		return
+	}
+	if err = os.WriteFile(brewfile, []byte(filterBrewfile(string(content))), 0600); err != nil {
+		b.out.Verbose("Failed to write filtered Brewfile: %v\n", err)
+		return
+	}
+
 	b.out.Verbose("Homebrew packages saved to Brewfile\n")
+}
+
+// filterBrewfile drops go "..." entries from a Brewfile.
+func filterBrewfile(content string) string {
+	var filtered []string
+	for line := range strings.SplitSeq(content, "\n") {
+		if !strings.HasPrefix(line, "go \"") {
+			filtered = append(filtered, line)
+		}
+	}
+	return strings.Join(filtered, "\n")
 }
 
 func (b *Backup) backupMASApps() {

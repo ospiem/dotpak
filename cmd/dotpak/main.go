@@ -112,7 +112,7 @@ Examples:
 		RunE: func(_ *cobra.Command, _ []string) error {
 			out := getOutput()
 
-			cfg, err := loadConfig(profile)
+			cfg, err := loadConfig(profile, out)
 			if err != nil {
 				return outputError(out, err)
 			}
@@ -192,7 +192,7 @@ Categories: ` + strings.Join(restore.CategoryNames(), ", "),
 		RunE: func(_ *cobra.Command, args []string) error {
 			out := getOutput()
 
-			cfg, err := loadConfig("")
+			cfg, err := loadConfig("", out)
 			if err != nil {
 				return outputError(out, err)
 			}
@@ -306,7 +306,7 @@ func listCmd() *cobra.Command {
 		RunE: func(_ *cobra.Command, _ []string) error {
 			out := getOutput()
 
-			cfg, err := loadConfig("")
+			cfg, err := loadConfig("", out)
 			if err != nil {
 				return outputError(out, fmt.Errorf("loading config: %w", err))
 			}
@@ -438,7 +438,7 @@ func diffCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			out := getOutput()
-			cfg, err := loadConfig("")
+			cfg, err := loadConfig("", out)
 			if err != nil {
 				return outputError(out, err)
 			}
@@ -460,7 +460,7 @@ func contentsCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			out := getOutput()
-			cfg, err := loadConfig("")
+			cfg, err := loadConfig("", out)
 			if err != nil {
 				return outputError(out, err)
 			}
@@ -509,7 +509,7 @@ func cronCmd() *cobra.Command {
 		RunE: func(_ *cobra.Command, _ []string) error {
 			out := getOutput()
 			// nil config only degrades the FDA check in the status display
-			cfg, _ := loadConfig("")
+			cfg, _ := loadConfig("", out)
 			return outputWrap(out, schedule.Status(cfg, out))
 		},
 	}
@@ -519,7 +519,10 @@ func cronCmd() *cobra.Command {
 		Short:  "Run backup with logging (used by launchd/cron)",
 		Hidden: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return schedule.Run(func() (*config.Config, error) { return loadConfig("") })
+			// Run logs its own errors; wrap so main does not print them again
+			return reportedErr(schedule.Run(func(out *output.Output) (*config.Config, error) {
+				return loadConfig("", out)
+			}))
 		},
 	}
 
@@ -554,7 +557,7 @@ func getOutput() *output.Output {
 // loadConfig loads the config named by --config (which must exist: silently
 // falling back to defaults would run a scheduled backup with the wrong items,
 // directory and no encryption) or the default path, which may be absent.
-func loadConfig(profile string) (*config.Config, error) {
+func loadConfig(profile string, out *output.Output) (*config.Config, error) {
 	cfgPath := configFile
 	if cfgPath == "" {
 		cfgPath = config.DefaultConfigPath()
@@ -567,7 +570,7 @@ func loadConfig(profile string) (*config.Config, error) {
 		return nil, err
 	}
 	if len(cfg.UnknownKeys) > 0 {
-		getOutput().Warning("Config %s has unknown keys (typo?): %s\n", cfgPath, strings.Join(cfg.UnknownKeys, ", "))
+		out.Warning("Config %s has unknown keys (typo?): %s\n", cfgPath, strings.Join(cfg.UnknownKeys, ", "))
 	}
 	return cfg, nil
 }

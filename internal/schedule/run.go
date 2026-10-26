@@ -15,8 +15,9 @@ import (
 // Run executes one scheduled backup (the hidden "dotpak cron run" command):
 // it appends a timestamped section to the backup log, runs the backup with
 // secrets included, and records the JSON result. Warnings go to the log too —
-// launchd discards the job's stderr, so nothing may be left there.
-func Run(loadConfig func() (*config.Config, error)) error {
+// launchd discards the job's stderr, so nothing may be left there; loadConfig
+// receives that same output for its own warnings.
+func Run(loadConfig func(out *output.Output) (*config.Config, error)) error {
 	logPath, err := LogPath()
 	if err != nil {
 		return err
@@ -34,14 +35,14 @@ func Run(loadConfig func() (*config.Config, error)) error {
 
 	fmt.Fprintf(logFile, "---\n%s\n", time.Now().Format(time.RFC3339))
 
-	cfg, err := loadConfig()
+	out := output.New(output.ModeQuiet, false)
+	out.SetErrWriter(logFile)
+
+	cfg, err := loadConfig(out)
 	if err != nil {
 		fmt.Fprintf(logFile, "error: %v\n", err)
 		return err
 	}
-
-	out := output.New(output.ModeQuiet, false)
-	out.SetErrWriter(logFile)
 
 	b, err := backup.New(cfg, &backup.Options{IncludeSecrets: true}, out)
 	if err != nil {

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/ospiem/dotpak/internal/config"
@@ -133,6 +134,19 @@ func TestSymlinkTargetWithinHome(t *testing.T) {
 	}
 }
 
+// The built-in floor must protect what it protected before matching became
+// component-aware, even when the user's own sensitive list leaves it out.
+func TestContainsSensitiveFiles_BuiltinFloor(t *testing.T) {
+	t.Parallel()
+
+	r := newQuietRestore(&config.Config{Sensitive: []string{".zshrc"}}, t.TempDir(), &Options{})
+	for _, file := range []string{".terraform.d/credentials.tfrc.json", ".dockercfg", ".ssh/id_ed25519"} {
+		if !r.containsSensitiveFiles([]string{file}) {
+			t.Errorf("%s should be covered by the built-in floor", file)
+		}
+	}
+}
+
 // The safety backup must treat everything the config calls sensitive as
 // sensitive, not only a built-in list: shell history and AI tool tokens are
 // in the default sensitive list and must never land in a plaintext archive
@@ -142,7 +156,10 @@ func TestContainsSensitiveFiles_UsesConfigSensitive(t *testing.T) {
 
 	r := newQuietRestore(config.DefaultConfig(), t.TempDir(), &Options{})
 
-	for _, file := range []string{".zsh_history", ".claude.json", ".codex/auth.json", ".ssh/config", ".terraformrc"} {
+	for _, file := range []string{
+		".zsh_history", ".claude.json", ".codex/auth.json", ".ssh/config", ".terraformrc",
+		".terraform.d/credentials.tfrc.json", ".dockercfg",
+	} {
 		if !r.containsSensitiveFiles([]string{file}) {
 			t.Errorf("%s should be sensitive", file)
 		}
@@ -340,4 +357,148 @@ func TestCreateSafetyBackup_EncryptedSourceWithoutRecipients(t *testing.T) {
 	if perm := info.Mode().Perm(); perm != 0600 {
 		t.Errorf("encrypted safety backup mode = %o, want 0600", perm)
 	}
+}
+
+// tarLink is an ordered symlink entry: entry order matters for the chained
+// escape below.
+type tarLink struct{ name, target string }
+
+func writeArchiveWithOrderedLinks(t *testing.T, path string, links []tarLink) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+	for _, l := range links {
+		hdr := &tar.Header{Name: l.name, Typeflag: tar.TypeSymlink, Linkname: l.target, Mode: 0777}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A lexically in-home target can resolve outside home once a symlink the
+// archive itself created is followed: ".x/s -> .." turns ".x/s/../outside"
+// into parent(home)/outside. Entry order lets the escaping link be created
+// before the link it climbs through, so the check has to run after all links
+// exist.
+func TestExtractStream_SymlinkChainCannotEscapeHome(t *testing.T) {
+	t.Parallel()
+
+	setup := setupTest(t)
+	outside := filepath.Join(filepath.Dir(setup.homeDir), "outside")
+	if err := os.MkdirAll(outside, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, links := range map[string][]tarLink{
+		"hop first": {
+			{".x/s", ".."},
+			{".bashrc", ".x/s/../outside/secret"},
+		},
+		"escaping link first": {
+			{".bashrc", ".x/s/../outside/secret"},
+			{".x/s", ".."},
+		},
+		"absolute through hop": {
+			{".x/s", ".."},
+			// not filepath.Join: it would collapse "s/.." before the check does
+			{".zshrc", setup.homeDir + "/.x/s/../outside/secret"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := filepath.Join(t.TempDir(), "home")
+			if err := os.MkdirAll(home, 0755); err != nil {
+				t.Fatal(err)
+			}
+			// rebase absolute targets onto this subtest's home
+			rebased := make([]tarLink, len(links))
+			for i, l := range links {
+				rebased[i] = tarLink{l.name, strings.ReplaceAll(l.target, setup.homeDir, home)}
+			}
+			archivePath := filepath.Join(setup.backupDir, strings.ReplaceAll(name, " ", "-")+".tar.gz")
+			writeArchiveWithOrderedLinks(t, archivePath, rebased)
+
+			r := newQuietRestore(
+				&config.Config{Backup: config.BackupConfig{BackupDir: setup.backupDir}},
+				home,
+				&Options{},
+			)
+			count, err := r.extractArchive(archivePath)
+			if err != nil {
+				t.Fatalf("extractArchive failed: %v", err)
+			}
+			if count != 1 {
+				t.Errorf("expected only the harmless hop to survive, got count=%d", count)
+			}
+
+			for _, link := range []string{".bashrc", ".zshrc"} {
+				if _, lstatErr := os.Lstat(filepath.Join(home, link)); !os.IsNotExist(lstatErr) {
+					t.Errorf("%s escaping through a symlink chain was left in place (err: %v)", link, lstatErr)
+				}
+			}
+			if _, lstatErr := os.Lstat(filepath.Join(home, ".x", "s")); lstatErr != nil {
+				t.Errorf("hop pointing at home itself should be kept: %v", lstatErr)
+			}
+		})
+	}
+}
+
+// A one-shot identity source (FIFO, process substitution) must be staged so
+// both decryption passes can read it.
+func TestResolveAgeIdentity_StagesOneShotSource(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // staging goes to ~/.cache/dotpak/tmp
+
+	fifo := filepath.Join(t.TempDir(), "identity.fifo")
+	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		f, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+		if err != nil {
+			return
+		}
+		_, _ = f.WriteString("AGE-SECRET-KEY-TEST\n")
+		_ = f.Close()
+	}()
+
+	files, cleanup, err := ResolveAgeIdentity(fifo, nil)
+	if err != nil {
+		t.Fatalf("ResolveAgeIdentity failed: %v", err)
+	}
+	defer cleanup()
+
+	if len(files) != 1 || files[0] == fifo {
+		t.Fatalf("expected a staged copy, got %v", files)
+	}
+	for range 2 {
+		content, readErr := os.ReadFile(files[0])
+		if readErr != nil || string(content) != "AGE-SECRET-KEY-TEST\n" {
+			t.Errorf("staged identity unreadable or wrong: %q, %v", content, readErr)
+		}
+	}
+	info, _ := os.Stat(files[0])
+	if info.Mode().Perm() != 0600 {
+		t.Errorf("staged identity mode = %o, want 0600", info.Mode().Perm())
+	}
+
+	// a regular file is used as-is
+	regular := filepath.Join(t.TempDir(), "key.txt")
+	if err = os.WriteFile(regular, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	files, cleanup, err = ResolveAgeIdentity(regular, nil)
+	if err != nil || len(files) != 1 || files[0] != regular {
+		t.Errorf("regular identity should be passed through, got %v, %v", files, err)
+	}
+	cleanup()
 }

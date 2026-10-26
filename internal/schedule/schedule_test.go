@@ -138,28 +138,33 @@ func TestBuildCronLine(t *testing.T) {
 }
 
 func TestAbsoluteConfigPath(t *testing.T) {
-	t.Parallel()
+	// t.Chdir is incompatible with t.Parallel
 
 	got, err := absoluteConfigPath("")
 	if err != nil || got != "" {
 		t.Errorf("absoluteConfigPath(\"\") = %q, %v; want empty", got, err)
 	}
 
+	dir := t.TempDir()
+	if err = os.WriteFile(filepath.Join(dir, "work.toml"), []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
 	got, err = absoluteConfigPath("./work.toml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cwd, _ := os.Getwd()
-	if want := filepath.Join(cwd, "work.toml"); got != want {
-		t.Errorf("absoluteConfigPath(./work.toml) = %q, want %q", got, want)
+	if !filepath.IsAbs(got) || filepath.Base(got) != "work.toml" {
+		t.Errorf("absoluteConfigPath(./work.toml) = %q, want absolute path to work.toml", got)
 	}
 
-	got, err = absoluteConfigPath("~/dotpak.toml")
-	if err != nil {
-		t.Fatal(err)
+	// a missing config must fail at install time, not at every scheduled run
+	if _, err = absoluteConfigPath("./typo.toml"); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Errorf("absoluteConfigPath(missing) error = %v, want config file not found", err)
 	}
-	if !filepath.IsAbs(got) || strings.HasPrefix(got, "~") {
-		t.Errorf("absoluteConfigPath(~/dotpak.toml) = %q, want expanded absolute path", got)
+	if _, err = absoluteConfigPath("~/dotpak-definitely-missing.toml"); err == nil {
+		t.Error("expected error for a missing ~ path")
 	}
 }
 

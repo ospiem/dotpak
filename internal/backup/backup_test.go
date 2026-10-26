@@ -694,6 +694,9 @@ func TestCleanupOldBackups_IgnoresPartialArchives(t *testing.T) {
 	createTestFile(t, filepath.Join(setup.backupDir, "dotfiles-20250101_120000.tar.gz"), "archive")
 	createTestFile(t, filepath.Join(setup.backupDir, "dotfiles-20250102_120000.tar.gz.partial"), "partial")
 	createTestFile(t, filepath.Join(setup.backupDir, "dotfiles-20250103_120000.tar.gz"), "archive")
+	// metadata whose archive was deleted by hand
+	orphan := filepath.Join(setup.backupDir, "dotfiles-20241231_120000.json")
+	createTestFile(t, orphan, "{}")
 
 	b := &Backup{
 		cfg: &config.Config{
@@ -709,6 +712,10 @@ func TestCleanupOldBackups_IgnoresPartialArchives(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(setup.backupDir, name)); err != nil {
 			t.Errorf("expected completed backup %s to survive cleanup: %v", name, err)
 		}
+	}
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("expected orphaned metadata to be removed, stat err: %v", err)
 	}
 
 	// a fresh partial may belong to a concurrent run and is left alone
@@ -939,4 +946,14 @@ func TestRunCommand(t *testing.T) {
 			t.Error("expected error for nonexistent command")
 		}
 	})
+}
+
+func TestFilterBrewfile(t *testing.T) {
+	t.Parallel()
+
+	in := "tap \"homebrew/bundle\"\nbrew \"go\"\ngo \"golang.org/x/tools/gopls\"\ncask \"iterm2\"\n"
+	want := "tap \"homebrew/bundle\"\nbrew \"go\"\ncask \"iterm2\"\n"
+	if got := filterBrewfile(in); got != want {
+		t.Errorf("filterBrewfile() =\n%q\nwant\n%q", got, want)
+	}
 }
