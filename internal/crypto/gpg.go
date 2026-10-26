@@ -1,7 +1,6 @@
 package crypto
 
 import (
-	"bytes"
 	"errors"
 	"io"
 	"os/exec"
@@ -31,16 +30,9 @@ func (e *GPGEncryptor) EncryptReader(r io.Reader, outputPath string) error {
 	}
 
 	//nolint:gosec // g204: recipient is a gpg key id from config, passed as a flag argument
-	cmd := exec.Command("gpg", "--batch", "--yes", "--encrypt", "--output", outputPath, "--recipient", e.recipient)
+	cmd := exec.Command("gpg", "--batch", "--yes", "--encrypt", "--recipient", e.recipient)
 	cmd.Stdin = r
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return cmdError("gpg encryption failed", err, &stderr)
-	}
-
-	return nil
+	return runToFile("gpg encryption failed", cmd, outputPath)
 }
 
 // DecryptReader streams the decrypted contents of inputPath. Passphrase entry

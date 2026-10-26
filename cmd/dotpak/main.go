@@ -2,21 +2,17 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ospiem/dotpak/internal/backup"
 	"github.com/ospiem/dotpak/internal/config"
-	"github.com/ospiem/dotpak/internal/crypto"
 	"github.com/ospiem/dotpak/internal/metadata"
 	"github.com/ospiem/dotpak/internal/osutils"
 	"github.com/ospiem/dotpak/internal/output"
@@ -80,6 +76,11 @@ Examples:
 	rootCmd.AddCommand(versionCmd())
 
 	if err := rootCmd.Execute(); err != nil {
+		// handlers report their own errors; everything else (unknown command
+		// or flag, argument validation) would otherwise exit silently
+		if _, ok := errors.AsType[*reportedError](err); !ok {
+			_ = outputError(getOutput(), err)
+		}
 		os.Exit(1)
 	}
 }
@@ -111,7 +112,7 @@ Examples:
 		RunE: func(_ *cobra.Command, _ []string) error {
 			out := getOutput()
 
-			cfg, err := loadConfig(profile)
+			cfg, err := loadConfig(profile, out)
 			if err != nil {
 				return outputError(out, err)
 			}
@@ -138,7 +139,7 @@ Examples:
 			result, runErr := b.Run()
 			if jsonOutput {
 				_ = out.JSON(result)
-				return runErr // the JSON envelope already carries the error
+				return reportedErr(runErr) // the JSON envelope already carries the error
 			}
 			if runErr != nil {
 				return outputError(out, runErr)
@@ -191,7 +192,7 @@ Categories: ` + strings.Join(restore.CategoryNames(), ", "),
 		RunE: func(_ *cobra.Command, args []string) error {
 			out := getOutput()
 
-			cfg, err := loadConfig("")
+			cfg, err := loadConfig("", out)
 			if err != nil {
 				return outputError(out, err)
 			}
@@ -212,7 +213,7 @@ Categories: ` + strings.Join(restore.CategoryNames(), ", "),
 			if len(args) > 0 {
 				archivePath = args[0]
 			} else {
-				archivePath = findLatestBackup(cfg.Backup.BackupDir)
+				archivePath = metadata.FindLatestBackup(cfg.Backup.BackupDir)
 				if archivePath == "" {
 					return outputError(out, fmt.Errorf("no backups found in %s", cfg.Backup.BackupDir))
 				}
@@ -277,7 +278,7 @@ Categories: ` + strings.Join(restore.CategoryNames(), ", "),
 			result, runErr := r.Run(archivePath)
 			if jsonOutput {
 				_ = out.JSON(result)
-				return runErr // the JSON envelope already carries the error
+				return reportedErr(runErr) // the JSON envelope already carries the error
 			}
 			if runErr != nil {
 				return outputError(out, runErr)
@@ -305,52 +306,16 @@ func listCmd() *cobra.Command {
 		RunE: func(_ *cobra.Command, _ []string) error {
 			out := getOutput()
 
-			cfg, err := loadConfig("")
+			cfg, err := loadConfig("", out)
 			if err != nil {
 				return outputError(out, fmt.Errorf("loading config: %w", err))
 			}
 			backupDir := cfg.Backup.BackupDir
 
-			entries, err := os.ReadDir(backupDir)
+			backups, err := metadata.ListBackups(backupDir)
 			if err != nil {
-				return outputError(out, fmt.Errorf("reading backup directory: %w", err))
+				return outputError(out, err)
 			}
-
-			var backups []metadata.BackupInfo
-
-			for _, entry := range entries {
-				name := entry.Name()
-				if !isArchiveFile(name) {
-					continue
-				}
-
-				fullPath := filepath.Join(backupDir, name)
-				info, infoErr := entry.Info()
-				if infoErr != nil {
-					// file became unreadable between ReadDir and Info - skip it
-					continue
-				}
-
-				backupInfo := metadata.BackupInfo{
-					Archive:   fullPath,
-					Timestamp: extractTimestamp(name),
-					Size:      info.Size(),
-					Encrypted: crypto.IsEncryptedPath(name),
-				}
-
-				metaPath := metadata.GetMetadataPath(fullPath)
-				if meta, loadErr := metadata.Load(metaPath); loadErr == nil {
-					backupInfo.Hostname = meta.Hostname
-					backupInfo.FileCount = meta.Stats.FilesBackedUp
-					backupInfo.Encryption = meta.EncryptionMethod
-				}
-
-				backups = append(backups, backupInfo)
-			}
-
-			sort.Slice(backups, func(i, j int) bool {
-				return backups[i].Timestamp > backups[j].Timestamp
-			})
 
 			result := &metadata.ListResult{
 				Success: true,
@@ -473,7 +438,7 @@ func diffCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			out := getOutput()
-			cfg, err := loadConfig("")
+			cfg, err := loadConfig("", out)
 			if err != nil {
 				return outputError(out, err)
 			}
@@ -495,7 +460,7 @@ func contentsCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			out := getOutput()
-			cfg, err := loadConfig("")
+			cfg, err := loadConfig("", out)
 			if err != nil {
 				return outputError(out, err)
 			}
@@ -544,7 +509,7 @@ func cronCmd() *cobra.Command {
 		RunE: func(_ *cobra.Command, _ []string) error {
 			out := getOutput()
 			// nil config only degrades the FDA check in the status display
-			cfg, _ := loadConfig("")
+			cfg, _ := loadConfig("", out)
 			return outputWrap(out, schedule.Status(cfg, out))
 		},
 	}
@@ -554,7 +519,10 @@ func cronCmd() *cobra.Command {
 		Short:  "Run backup with logging (used by launchd/cron)",
 		Hidden: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return cronRun()
+			// Run logs its own errors; wrap so main does not print them again
+			return reportedErr(schedule.Run(func(out *output.Output) (*config.Config, error) {
+				return loadConfig("", out)
+			}))
 		},
 	}
 
@@ -586,12 +554,40 @@ func getOutput() *output.Output {
 	return output.New(mode, verbose)
 }
 
-func loadConfig(profile string) (*config.Config, error) {
+// loadConfig loads the config named by --config (which must exist: silently
+// falling back to defaults would run a scheduled backup with the wrong items,
+// directory and no encryption) or the default path, which may be absent.
+func loadConfig(profile string, out *output.Output) (*config.Config, error) {
 	cfgPath := configFile
 	if cfgPath == "" {
 		cfgPath = config.DefaultConfigPath()
+	} else if _, err := os.Stat(cfgPath); err != nil {
+		return nil, fmt.Errorf("config file not found: %s", cfgPath)
 	}
-	return config.LoadWithProfile(cfgPath, profile)
+
+	cfg, err := config.LoadWithProfile(cfgPath, profile)
+	if err != nil {
+		return nil, err
+	}
+	if len(cfg.UnknownKeys) > 0 {
+		out.Warning("Config %s has unknown keys (typo?): %s\n", cfgPath, strings.Join(cfg.UnknownKeys, ", "))
+	}
+	return cfg, nil
+}
+
+// reportedError marks an error that has already been shown to the user, so
+// main does not print it a second time.
+type reportedError struct{ err error }
+
+func (e *reportedError) Error() string { return e.err.Error() }
+func (e *reportedError) Unwrap() error { return e.err }
+
+// reportedErr wraps a non-nil error as already reported; nil stays nil.
+func reportedErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &reportedError{err: err}
 }
 
 // outputError reports err to the user exactly once (cobra's own error
@@ -605,7 +601,7 @@ func outputError(out *output.Output, err error) error {
 	} else {
 		out.Error("%v\n", err)
 	}
-	return err
+	return reportedErr(err)
 }
 
 // outputWrap passes nil through and reports non-nil errors via outputError.
@@ -614,98 +610,4 @@ func outputWrap(out *output.Output, err error) error {
 		return nil
 	}
 	return outputError(out, err)
-}
-
-func cronRun() error {
-	logPath, err := schedule.LogPath()
-	if err != nil {
-		return err
-	}
-
-	if err = os.MkdirAll(filepath.Dir(logPath), 0700); err != nil {
-		return fmt.Errorf("creating log directory: %w", err)
-	}
-
-	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-	if err != nil {
-		return fmt.Errorf("opening log file: %w", err)
-	}
-	defer logFile.Close()
-
-	fmt.Fprintf(logFile, "---\n%s\n", time.Now().Format(time.RFC3339))
-
-	cfg, err := loadConfig("")
-	if err != nil {
-		fmt.Fprintf(logFile, "error: %v\n", err)
-		return err
-	}
-
-	out := output.New(output.ModeQuiet, false)
-
-	b, err := backup.New(cfg, &backup.Options{IncludeSecrets: true}, out)
-	if err != nil {
-		fmt.Fprintf(logFile, "error: %v\n", err)
-		return err
-	}
-
-	result, runErr := b.Run()
-	enc := json.NewEncoder(logFile)
-	enc.SetIndent("", "  ")
-	if encErr := enc.Encode(result); encErr != nil {
-		fmt.Fprintf(logFile, "error encoding result: %v\n", encErr)
-	}
-	if runErr != nil {
-		fmt.Fprintf(logFile, "error: %v\n", runErr)
-	}
-	return runErr
-}
-
-func findLatestBackup(backupDir string) string {
-	entries, err := os.ReadDir(backupDir)
-	if err != nil {
-		return ""
-	}
-
-	var archives []string
-	for _, entry := range entries {
-		name := entry.Name()
-		if isArchiveFile(name) {
-			archives = append(archives, filepath.Join(backupDir, name))
-		}
-	}
-
-	if len(archives) == 0 {
-		return ""
-	}
-
-	sort.Strings(archives)
-	return archives[len(archives)-1]
-}
-
-func isArchiveFile(name string) bool {
-	if !strings.HasPrefix(name, metadata.ArchivePrefix) {
-		return false
-	}
-	base := name
-	if method := crypto.DetectMethod(base); method != crypto.MethodNone {
-		base = strings.TrimSuffix(base, method.Extension())
-	}
-	return strings.HasSuffix(base, ".tar.gz")
-}
-
-// extractTimestamp extracts and formats the timestamp from an archive filename.
-// Archive names have the format: dotfiles-YYYYMMDD_HHMMSS.tar.gz[.age|.gpg]
-// Example: dotfiles-20240115_143022.tar.gz -> "2024-01-15 14:30:22".
-func extractTimestamp(name string) string {
-	prefixLen := len(metadata.ArchivePrefix)
-	tsLen := len(metadata.TimestampFormat) // YYYYMMDD_HHMMSS
-
-	if len(name) < prefixLen+tsLen {
-		return ""
-	}
-	ts := name[prefixLen : prefixLen+tsLen]
-	// format: YYYYMMDD_HHMMSS -> YYYY-MM-DD HH:MM:SS
-	return fmt.Sprintf("%s-%s-%s %s:%s:%s",
-		ts[0:4], ts[4:6], ts[6:8], // year, Month, Day
-		ts[9:11], ts[11:13], ts[13:15]) // hour, Minute, Second
 }

@@ -245,6 +245,41 @@ items = [".zshrc"]
 		}
 	})
 
+	t.Run("normalizes profile and host item paths", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		configPath := filepath.Join(tmpDir, "config.toml")
+		home, _ := os.UserHomeDir()
+
+		content := `
+items = [".zshrc"]
+
+[backup]
+backup_dir = "~/backups"
+encryption = "none"
+
+[profile.work]
+items = ["~/.config/work"]
+extra_items = ["$HOME/.work-extra", "` + filepath.Join(home, ".work-abs") + `"]
+extra_sensitive = ["~/.work-secret"]
+`
+		if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg, err := LoadWithProfile(configPath, "work")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		wantItems := []string{".config/work", ".work-extra", ".work-abs"}
+		if !slices.Equal(cfg.Items, wantItems) {
+			t.Errorf("Items = %v, want %v", cfg.Items, wantItems)
+		}
+		if !slices.Contains(cfg.Sensitive, ".work-secret") {
+			t.Errorf("Sensitive = %v, want normalized .work-secret", cfg.Sensitive)
+		}
+	})
+
 	t.Run("returns error for non-existent profile", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		configPath := filepath.Join(tmpDir, "config.toml")
@@ -447,7 +482,7 @@ backup_dir = "~/backups"
 encryption = "none"
 
 [host.` + hostname + `]
-extra_items = [".config/host-specific"]
+extra_items = [".config/host-specific", "~/.host-tilde"]
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatal(err)
@@ -461,5 +496,56 @@ extra_items = [".config/host-specific"]
 	found := slices.Contains(cfg.Items, ".config/host-specific")
 	if !found {
 		t.Error("expected host-specific item to be applied")
+	}
+	if !slices.Contains(cfg.Items, ".host-tilde") {
+		t.Errorf("expected host item ~/.host-tilde to be normalized, got %v", cfg.Items)
+	}
+}
+
+func TestLoadReportsUnknownKeys(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	content := `
+items = [".zshrc"]
+
+[backup]
+backup_dir = "~/backups"
+max_backup = 5
+
+[backups]
+encryption = "age"
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []string{"backup.max_backup", "backups", "backups.encryption"}
+	slices.Sort(cfg.UnknownKeys)
+	if !slices.Equal(cfg.UnknownKeys, want) {
+		t.Errorf("UnknownKeys = %v, want %v", cfg.UnknownKeys, want)
+	}
+
+	validateErr := Validate(cfg)
+	if validateErr == nil || !strings.Contains(validateErr.Error(), "backup.max_backup") {
+		t.Errorf("Validate() = %v, want it to report the unknown key", validateErr)
+	}
+}
+
+// Default excludes must not gut default items: skills and Claude memory live
+// in Markdown and shell files inside directories named like dev artifacts.
+func TestDefaultExcludesKeepAgentFiles(t *testing.T) {
+	t.Parallel()
+
+	for _, pattern := range DefaultConfig().Excludes.Patterns {
+		switch pattern {
+		case "*.md", "*.sh", "docs", "test", "tests":
+			t.Errorf("default exclude %q would drop .codex/skills and .claude/projects content", pattern)
+		}
 	}
 }

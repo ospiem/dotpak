@@ -117,6 +117,57 @@ func TestBuildCronCommand(t *testing.T) {
 	}
 }
 
+func TestBuildCronLine(t *testing.T) {
+	t.Parallel()
+
+	got := buildCronLine(15, "/opt/bin:/usr/bin", []string{"/bin/dotpak", "cron", "run"}, "/home/u/backup.log")
+	want := "0 15 * * * { echo '---'; date -Iseconds; PATH=/opt/bin:/usr/bin /bin/dotpak cron run; } " +
+		">> /home/u/backup.log 2>&1 # dotpak"
+	if got != want {
+		t.Errorf("buildCronLine =\n%s\nwant\n%s", got, want)
+	}
+
+	// '%' becomes a newline in crontab unless backslash-escaped, quoting or not
+	got = buildCronLine(3, "/usr/bin", []string{"/opt/100%/dotpak", "cron", "run"}, "/var/log/50% full.log")
+	if strings.Contains(strings.ReplaceAll(got, `\%`, ""), "%") {
+		t.Errorf("unescaped %% in cron line: %s", got)
+	}
+	if !strings.Contains(got, `/opt/100\%/dotpak`) || !strings.Contains(got, `'/var/log/50\% full.log'`) {
+		t.Errorf("expected escaped %% in paths: %s", got)
+	}
+}
+
+func TestAbsoluteConfigPath(t *testing.T) {
+	// t.Chdir is incompatible with t.Parallel
+
+	got, err := absoluteConfigPath("")
+	if err != nil || got != "" {
+		t.Errorf("absoluteConfigPath(\"\") = %q, %v; want empty", got, err)
+	}
+
+	dir := t.TempDir()
+	if err = os.WriteFile(filepath.Join(dir, "work.toml"), []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	got, err = absoluteConfigPath("./work.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(got) || filepath.Base(got) != "work.toml" {
+		t.Errorf("absoluteConfigPath(./work.toml) = %q, want absolute path to work.toml", got)
+	}
+
+	// a missing config must fail at install time, not at every scheduled run
+	if _, err = absoluteConfigPath("./typo.toml"); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Errorf("absoluteConfigPath(missing) error = %v, want config file not found", err)
+	}
+	if _, err = absoluteConfigPath("~/dotpak-definitely-missing.toml"); err == nil {
+		t.Error("expected error for a missing ~ path")
+	}
+}
+
 func TestBackupArgs(t *testing.T) {
 	t.Parallel()
 

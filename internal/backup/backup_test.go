@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ospiem/dotpak/internal/config"
+	"github.com/ospiem/dotpak/internal/metadata"
 	"github.com/ospiem/dotpak/internal/output"
 )
 
@@ -344,7 +345,7 @@ func TestCreateArchive(t *testing.T) {
 	}
 
 	// the temporary file used for the atomic rename must be gone
-	if _, err := os.Stat(archivePath + partialSuffix); !os.IsNotExist(err) {
+	if _, err := os.Stat(archivePath + metadata.PartialSuffix); !os.IsNotExist(err) {
 		t.Errorf("expected no leftover partial file, stat err: %v", err)
 	}
 
@@ -682,6 +683,58 @@ func TestCleanupOldBackups_DisabledWhenZero(t *testing.T) {
 	}
 }
 
+// A leftover .partial file must not consume a retention slot: with
+// max_backups = 2, one older completed backup, one newer partial and a new
+// completed backup, the older completed backup has to survive.
+func TestCleanupOldBackups_IgnoresPartialArchives(t *testing.T) {
+	t.Parallel()
+
+	setup := setupTest(t)
+
+	createTestFile(t, filepath.Join(setup.backupDir, "dotfiles-20250101_120000.tar.gz"), "archive")
+	createTestFile(t, filepath.Join(setup.backupDir, "dotfiles-20250102_120000.tar.gz.partial"), "partial")
+	createTestFile(t, filepath.Join(setup.backupDir, "dotfiles-20250103_120000.tar.gz"), "archive")
+	// metadata whose archive was deleted by hand
+	orphan := filepath.Join(setup.backupDir, "dotfiles-20241231_120000.json")
+	createTestFile(t, orphan, "{}")
+
+	b := &Backup{
+		cfg: &config.Config{
+			Backup: config.BackupConfig{BackupDir: setup.backupDir, MaxBackups: 2},
+		},
+		homeDir: setup.homeDir,
+		out:     output.New(output.ModeQuiet, false),
+	}
+
+	b.cleanupOldBackups()
+
+	for _, name := range []string{"dotfiles-20250101_120000.tar.gz", "dotfiles-20250103_120000.tar.gz"} {
+		if _, err := os.Stat(filepath.Join(setup.backupDir, name)); err != nil {
+			t.Errorf("expected completed backup %s to survive cleanup: %v", name, err)
+		}
+	}
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("expected orphaned metadata to be removed, stat err: %v", err)
+	}
+
+	// a fresh partial may belong to a concurrent run and is left alone
+	partial := filepath.Join(setup.backupDir, "dotfiles-20250102_120000.tar.gz.partial")
+	if _, err := os.Stat(partial); err != nil {
+		t.Errorf("expected fresh partial to be left alone: %v", err)
+	}
+
+	// an abandoned one is garbage and gets removed
+	stale := time.Now().Add(-2 * stalePartialAge)
+	if err := os.Chtimes(partial, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	b.cleanupOldBackups()
+	if _, err := os.Stat(partial); !os.IsNotExist(err) {
+		t.Errorf("expected stale partial to be removed, stat err: %v", err)
+	}
+}
+
 func TestCollectItem_SkipsFIFO(t *testing.T) {
 	t.Parallel()
 
@@ -893,4 +946,14 @@ func TestRunCommand(t *testing.T) {
 			t.Error("expected error for nonexistent command")
 		}
 	})
+}
+
+func TestFilterBrewfile(t *testing.T) {
+	t.Parallel()
+
+	in := "tap \"homebrew/bundle\"\nbrew \"go\"\ngo \"golang.org/x/tools/gopls\"\ncask \"iterm2\"\n"
+	want := "tap \"homebrew/bundle\"\nbrew \"go\"\ncask \"iterm2\"\n"
+	if got := filterBrewfile(in); got != want {
+		t.Errorf("filterBrewfile() =\n%q\nwant\n%q", got, want)
+	}
 }

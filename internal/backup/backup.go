@@ -437,12 +437,18 @@ func (b *Backup) isExcluded(path string) bool {
 	return false
 }
 
+// stalePartialAge is how long an abandoned .partial archive is left alone
+// before cleanup removes it; a running backup never takes this long.
+const stalePartialAge = 24 * time.Hour
+
+// cleanupOldBackups keeps the newest max_backups completed archives, removing
+// each older archive together with its metadata sibling. Only completed
+// archives consume retention slots: an abandoned .partial file must not push a
+// usable backup out of the window, so it is removed separately once stale.
 func (b *Backup) cleanupOldBackups() {
 	if b.cfg.Backup.MaxBackups <= 0 {
 		return
 	}
-
-	groups := make(map[string][]string)
 
 	entries, err := os.ReadDir(b.cfg.Backup.BackupDir)
 	if err != nil {
@@ -450,68 +456,105 @@ func (b *Backup) cleanupOldBackups() {
 		return
 	}
 
+	groups := make(map[string][]string)
+	completed := make(map[string]bool)
+
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, metadata.ArchivePrefix) {
+		path := filepath.Join(b.cfg.Backup.BackupDir, name)
+
+		if metadata.IsPartialName(name) {
+			b.removeStalePartial(entry, path)
 			continue
 		}
 
-		parts := strings.SplitN(strings.TrimPrefix(name, metadata.ArchivePrefix), ".", 2)
-		if len(parts) > 0 {
-			timestamp := parts[0]
-			groups[timestamp] = append(groups[timestamp], filepath.Join(b.cfg.Backup.BackupDir, name))
+		ts, ok := metadata.ArchiveTimestamp(name)
+		if !ok {
+			continue
+		}
+		groups[ts] = append(groups[ts], path)
+		if metadata.IsArchiveName(name) {
+			completed[ts] = true
 		}
 	}
 
 	var timestamps []string
-	for ts := range groups {
+	for ts := range completed {
 		timestamps = append(timestamps, ts)
 	}
 	sort.Strings(timestamps)
+
+	// metadata whose archive is gone (deleted by hand, or a partially failed
+	// cleanup) is useless on its own and would otherwise pile up forever
+	for ts, paths := range groups {
+		if !completed[ts] {
+			b.removeBackupFiles(paths, "orphaned metadata")
+		}
+	}
 
 	toRemove := len(timestamps) - b.cfg.Backup.MaxBackups
 	if toRemove <= 0 {
 		return
 	}
 
-	for i := range toRemove {
-		ts := timestamps[i]
-		for _, path := range groups[ts] {
-			b.out.Verbose("Removing old backup: %s\n", filepath.Base(path))
-			if rmErr := os.Remove(path); rmErr != nil {
-				b.out.Verbose("Failed to remove old backup %s: %v\n", filepath.Base(path), rmErr)
-			}
+	for _, ts := range timestamps[:toRemove] {
+		b.removeBackupFiles(groups[ts], "old backup")
+	}
+}
+
+func (b *Backup) removeBackupFiles(paths []string, what string) {
+	for _, path := range paths {
+		b.out.Verbose("Removing %s: %s\n", what, filepath.Base(path))
+		if rmErr := os.Remove(path); rmErr != nil {
+			b.out.Verbose("Failed to remove %s %s: %v\n", what, filepath.Base(path), rmErr)
 		}
+	}
+}
+
+func (b *Backup) removeStalePartial(entry os.DirEntry, path string) {
+	info, err := entry.Info()
+	if err != nil || time.Since(info.ModTime()) < stalePartialAge {
+		return
+	}
+	b.out.Verbose("Removing abandoned partial archive: %s\n", entry.Name())
+	if rmErr := os.Remove(path); rmErr != nil {
+		b.out.Verbose("Failed to remove partial archive %s: %v\n", entry.Name(), rmErr)
 	}
 }
 
 func (b *Backup) backupHomebrew() {
 	brewfile := filepath.Join(b.cfg.Backup.BackupDir, "Brewfile")
-	if err := runCommand("brew", "bundle", "dump", "--file="+brewfile, "--force", "--describe"); err != nil {
+	// no --describe: descriptions are the default since Homebrew 5 and the
+	// flag is rejected ("disabled") by current versions
+	if err := runCommand("brew", "bundle", "dump", "--file="+brewfile, "--force"); err != nil {
 		b.out.Verbose("Homebrew backup failed: %v\n", err)
 		return
 	}
 
-	// filter out go "..." lines (they're saved separately in go-packages.txt)
+	// recent Homebrew dumps go "..." entries; they are restored from
+	// go-packages.txt, and brew bundle install would go install them again
 	content, err := os.ReadFile(brewfile)
 	if err != nil {
 		b.out.Verbose("Failed to read Brewfile: %v\n", err)
 		return
 	}
-
-	var filtered []string
-	for line := range strings.SplitSeq(string(content), "\n") {
-		if !strings.HasPrefix(line, "go \"") {
-			filtered = append(filtered, line)
-		}
-	}
-
-	if err = os.WriteFile(brewfile, []byte(strings.Join(filtered, "\n")), 0600); err != nil {
+	if err = os.WriteFile(brewfile, []byte(filterBrewfile(string(content))), 0600); err != nil {
 		b.out.Verbose("Failed to write filtered Brewfile: %v\n", err)
 		return
 	}
 
 	b.out.Verbose("Homebrew packages saved to Brewfile\n")
+}
+
+// filterBrewfile drops go "..." entries from a Brewfile.
+func filterBrewfile(content string) string {
+	var filtered []string
+	for line := range strings.SplitSeq(content, "\n") {
+		if !strings.HasPrefix(line, "go \"") {
+			filtered = append(filtered, line)
+		}
+	}
+	return strings.Join(filtered, "\n")
 }
 
 func (b *Backup) backupMASApps() {
@@ -556,44 +599,26 @@ func (b *Backup) backupGoPackages() {
 		goBinDir = filepath.Join(goPath, "bin")
 	}
 
-	entries, err := os.ReadDir(goBinDir)
-	if err != nil {
+	if _, err := os.Stat(goBinDir); err != nil {
+		b.out.Verbose("Go packages backup skipped: %v\n", err)
+		return
+	}
+
+	// one invocation reports every binary in the directory:
+	//   <binary>: go1.x
+	//   \tpath\t<module_path>
+	//   ...
+	// non-Go files only produce stderr noise, which is ignored.
+	commandOutput, err := runCommandOutput("go", "version", "-m", goBinDir)
+	if err != nil && commandOutput == "" {
 		b.out.Verbose("Go packages backup skipped: %v\n", err)
 		return
 	}
 
 	var packages []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		binPath := filepath.Join(goBinDir, entry.Name())
-		info, infoErr := entry.Info()
-		if infoErr != nil {
-			continue
-		}
-		// skip non-executable files
-		if info.Mode()&0111 == 0 {
-			continue
-		}
-
-		// get module path using go version -m
-		output, cmdErr := runCommandOutput("go", "version", "-m", binPath)
-		if cmdErr != nil {
-			continue
-		}
-
-		// parse output to find module path
-		// format: <binary>\n\tpath\t<module_path>\n...
-		for line := range strings.SplitSeq(output, "\n") {
-			line = strings.TrimSpace(line)
-			if modulePath, found := strings.CutPrefix(line, "path\t"); found {
-				if modulePath != "" {
-					packages = append(packages, modulePath)
-				}
-				break
-			}
+	for line := range strings.SplitSeq(commandOutput, "\n") {
+		if modulePath, found := strings.CutPrefix(strings.TrimSpace(line), "path\t"); found && modulePath != "" {
+			packages = append(packages, modulePath)
 		}
 	}
 

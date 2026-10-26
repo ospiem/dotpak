@@ -4,6 +4,7 @@ package schedule
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -22,6 +23,10 @@ const (
 // Install sets up a daily backup at the given hour. configFile, when not
 // empty, is passed to the scheduled command via --config.
 func Install(hour int, configFile string, out *output.Output) error {
+	configFile, err := absoluteConfigPath(configFile)
+	if err != nil {
+		return err
+	}
 	switch runtime.GOOS {
 	case darwin:
 		return installLaunchd(hour, configFile, out)
@@ -70,6 +75,25 @@ func LogPath() (string, error) {
 	return filepath.Join(home, ".local", "share", "dotpak", "backup.log"), nil
 }
 
+// absoluteConfigPath makes configFile absolute and checks that it exists:
+// launchd runs jobs with cwd=/ and cron with the home directory, so a relative
+// path baked into the job would resolve against the wrong directory, and a
+// missing one would make every scheduled run fail (cron run refuses to fall
+// back to defaults) with nothing but a log line to show for it.
+func absoluteConfigPath(configFile string) (string, error) {
+	if configFile == "" {
+		return "", nil
+	}
+	abs, err := filepath.Abs(osutils.ExpandPath(configFile))
+	if err != nil {
+		return "", fmt.Errorf("resolving config path: %w", err)
+	}
+	if _, err = os.Stat(abs); err != nil {
+		return "", fmt.Errorf("config file not found: %s", abs)
+	}
+	return abs, nil
+}
+
 // backupArgs builds the scheduled command line: dotpak cron run [--config path].
 func backupArgs(execPath, configFile string) []string {
 	if configFile != "" {
@@ -93,7 +117,8 @@ func resolvedExecutable() (string, error) {
 
 // shellQuote quotes a value for safe use in a shell command line. Anything
 // outside a conservative allowlist of characters is single-quoted, so shell
-// metacharacters (;, |, &, backticks, ...) can never break out.
+// metacharacters (;, |, &, backticks, ...) can never break out. It does not
+// handle crontab's own '%' rule; see cronEscape.
 func shellQuote(value string) string {
 	if value == "" {
 		return "''"

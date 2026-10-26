@@ -12,6 +12,9 @@ import (
 	"github.com/ospiem/dotpak/internal/osutils"
 )
 
+// EncryptionNone is the backup.encryption value that disables encryption.
+const EncryptionNone = "none"
+
 // Config represents the main configuration structure.
 type Config struct {
 	Backup    BackupConfig          `toml:"backup"`
@@ -20,6 +23,11 @@ type Config struct {
 	Excludes  ExcludesConfig        `toml:"excludes"`
 	Profiles  map[string]Profile    `toml:"profile"`
 	Hosts     map[string]HostConfig `toml:"host"`
+
+	// UnknownKeys lists keys present in the file that match nothing above
+	// (typos like max_backup or [backups]). They are reported, not fatal, so
+	// an old config keeps working after a key is renamed.
+	UnknownKeys []string `toml:"-"`
 }
 
 // BackupConfig holds backup-related settings.
@@ -65,7 +73,7 @@ func DefaultConfig() *Config {
 		Backup: BackupConfig{
 			BackupDir:        filepath.Join(home, "backups", "dotfiles"),
 			MaxBackups:       14,
-			Encryption:       "none",
+			Encryption:       EncryptionNone,
 			AgeRecipients:    "", // user must explicitly configure
 			AgeIdentityFiles: nil,
 		},
@@ -143,8 +151,8 @@ func DefaultConfig() *Config {
 				".DS_Store", "*.sock", "*.cache",
 				// CI/CD and dev artifacts
 				".circleci", ".github", ".travis.yml", ".gitlab-ci.yml",
-				"Makefile", "Dockerfile", "*.md", "LICENSE*", "COPYING*",
-				"Gemfile*", "*.spec", "*.rb", "test", "tests", "spec",
+				"Makefile", "Dockerfile", "LICENSE*", "COPYING*",
+				"Gemfile*", "*.spec", "*.rb", "spec",
 				".editorconfig", ".gitignore", ".gitattributes",
 				".rspec", ".rubocop*", ".ruby-version",
 				// python
@@ -172,9 +180,9 @@ func DefaultConfig() *Config {
 				// oh-my-zsh cloned plugins artifacts
 				"gitstatus/src", "gitstatus/deps", "gitstatus/usrbin",
 				"*.png", "*.gif", "*.jpg", "*.svg",
-				"test-data", "docs",
+				"test-data",
 				// misc dev files
-				"*.sh", "DESCRIPTION", "URL", "VERSION", "ZSH_VERSIONS",
+				"DESCRIPTION", "URL", "VERSION", "ZSH_VERSIONS",
 				".revision-hash", ".version",
 			},
 		},
@@ -209,27 +217,24 @@ func Load(path string) (*Config, error) {
 	// being silently coerced back to the default.
 	cfg := DefaultConfig()
 
-	if _, decodeErr := toml.Decode(string(data), cfg); decodeErr != nil {
+	md, decodeErr := toml.Decode(string(data), cfg)
+	if decodeErr != nil {
 		return nil, fmt.Errorf("parsing config: %w", decodeErr)
+	}
+	for _, key := range md.Undecoded() {
+		cfg.UnknownKeys = append(cfg.UnknownKeys, key.String())
 	}
 
 	if cfg.Backup.Encryption == "" {
-		cfg.Backup.Encryption = "none"
+		cfg.Backup.Encryption = EncryptionNone
 	}
 
 	cfg.Backup.BackupDir = osutils.ExpandPath(cfg.Backup.BackupDir)
 	cfg.Backup.AgeRecipients = osutils.ExpandPath(cfg.Backup.AgeRecipients)
 	cfg.Backup.AgeIdentityFiles = expandPaths(cfg.Backup.AgeIdentityFiles)
 
-	// items and Sensitive are consumed as paths relative to $HOME by backup/restore,
-	// so normalize any ~/ or absolute-under-$HOME forms back to home-relative.
-	home, _ := osutils.HomeDir()
-	for i, item := range cfg.Items {
-		cfg.Items[i] = normalizeItemPath(item, home)
-	}
-	for i, item := range cfg.Sensitive {
-		cfg.Sensitive[i] = normalizeItemPath(item, home)
-	}
+	cfg.Items = normalizeItemPaths(cfg.Items)
+	cfg.Sensitive = normalizeItemPaths(cfg.Sensitive)
 
 	return cfg, nil
 }
@@ -262,10 +267,10 @@ func LoadWithProfile(path, profileName string) (*Config, error) {
 
 func (c *Config) applyHostConfig(host HostConfig) {
 	if len(host.ExtraItems) > 0 {
-		c.Items = append(c.Items, host.ExtraItems...)
+		c.Items = append(c.Items, normalizeItemPaths(host.ExtraItems)...)
 	}
 	if len(host.ExtraSensitive) > 0 {
-		c.Sensitive = append(c.Sensitive, host.ExtraSensitive...)
+		c.Sensitive = append(c.Sensitive, normalizeItemPaths(host.ExtraSensitive)...)
 	}
 	if len(host.Excludes.Patterns) > 0 {
 		c.Excludes.Patterns = append(c.Excludes.Patterns, host.Excludes.Patterns...)
@@ -274,20 +279,36 @@ func (c *Config) applyHostConfig(host HostConfig) {
 
 func (c *Config) applyProfile(profile Profile) {
 	if len(profile.Items) > 0 {
-		c.Items = profile.Items
+		c.Items = normalizeItemPaths(profile.Items)
 	}
 	if len(profile.Sensitive) > 0 {
-		c.Sensitive = profile.Sensitive
+		c.Sensitive = normalizeItemPaths(profile.Sensitive)
 	}
 	if len(profile.ExtraItems) > 0 {
-		c.Items = append(c.Items, profile.ExtraItems...)
+		c.Items = append(c.Items, normalizeItemPaths(profile.ExtraItems)...)
 	}
 	if len(profile.ExtraSensitive) > 0 {
-		c.Sensitive = append(c.Sensitive, profile.ExtraSensitive...)
+		c.Sensitive = append(c.Sensitive, normalizeItemPaths(profile.ExtraSensitive)...)
 	}
 	if len(profile.Excludes.Patterns) > 0 {
 		c.Excludes.Patterns = append(c.Excludes.Patterns, profile.Excludes.Patterns...)
 	}
+}
+
+// normalizeItemPaths applies normalizeItemPath to every item: items and
+// sensitive are consumed as paths relative to $HOME by backup/restore, so any
+// ~/ or absolute-under-$HOME form must be brought back to home-relative —
+// wherever the list came from (top level, [host.*] or [profile.*]).
+func normalizeItemPaths(items []string) []string {
+	if len(items) == 0 {
+		return items
+	}
+	home, _ := osutils.HomeDir()
+	normalized := make([]string, len(items))
+	for i, item := range items {
+		normalized[i] = normalizeItemPath(item, home)
+	}
+	return normalized
 }
 
 // normalizeItemPath converts a config item path to the home-relative form

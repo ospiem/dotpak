@@ -5,6 +5,7 @@ package archive
 import (
 	"archive/tar"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -62,6 +63,11 @@ func EncryptStream(enc crypto.Encryptor, outputPath string, write func(w io.Writ
 	return nil
 }
 
+// ErrTruncated reports that a file grew while it was being read: the archive
+// holds a complete entry with the first header.Size bytes, so callers may
+// treat it as archived (with a warning) rather than skipped.
+var ErrTruncated = errors.New("file grew while reading")
+
 // AddFileToTar adds a single file (or symlink) to a tar writer. Non-regular
 // files such as FIFOs, sockets, and devices are rejected: opening a FIFO with
 // no writer would block the backup forever.
@@ -108,7 +114,19 @@ func AddFileToTar(tw *tar.Writer, fullPath, relPath string) error {
 		return err
 	}
 
-	written, err := io.Copy(tw, file)
+	return writeEntryBody(tw, file, header.Size, relPath)
+}
+
+// writeEntryBody copies exactly size bytes of r into the current tar entry and
+// keeps the stream consistent when the file changed size after it was sized.
+func writeEntryBody(tw *tar.Writer, r io.Reader, size int64, relPath string) error {
+	written, err := io.Copy(tw, r)
+	if errors.Is(err, tar.ErrWriteTooLong) {
+		// the file grew after Lstat (append-only files like shell history do
+		// this routinely); tar wrote exactly size bytes, so the entry is
+		// complete and the stream stays consistent
+		return fmt.Errorf("%w: %s archived with the first %d bytes", ErrTruncated, relPath, size)
+	}
 	if err != nil {
 		return fmt.Errorf("adding %s: %w", relPath, err)
 	}
@@ -116,12 +134,12 @@ func AddFileToTar(tw *tar.Writer, fullPath, relPath string) error {
 	// a file that shrank between Lstat and read would otherwise leave the tar
 	// stream short, poisoning every subsequent WriteHeader. Pad the entry to
 	// the declared size so the archive stays consistent, and report the file.
-	if written < header.Size {
-		if padErr := padTarEntry(tw, header.Size-written); padErr != nil {
+	if written < size {
+		if padErr := padTarEntry(tw, size-written); padErr != nil {
 			return fmt.Errorf("padding %s after size change: %w", relPath, padErr)
 		}
 		return fmt.Errorf("%s changed while reading: wrote %d of %d bytes (entry zero-padded)",
-			relPath, written, header.Size)
+			relPath, written, size)
 	}
 
 	return nil

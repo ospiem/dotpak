@@ -60,42 +60,59 @@ func maskedByDecryption(err error) bool {
 
 // ResolveAgeIdentity resolves identity files from a CLI override or config.
 // When override is "-", the identity is read from stdin; any other value is
-// used as a path directly (so process substitution works); "" falls back to
-// the config.
+// used as a path (so process substitution works); "" falls back to the config.
 //
-// A stdin identity is staged in a 0600 file under ~/.cache/dotpak/tmp: one run
-// decrypts the archive more than once (safety-backup scan, then extraction)
-// while stdin can only be read once. The returned cleanup removes that file.
+// Identities that can only be read once — stdin, a FIFO, a process
+// substitution's /dev/fd/N — are staged in a 0600 file under
+// ~/.cache/dotpak/tmp: one run decrypts the archive more than once
+// (safety-backup scan or verification, then extraction). The returned cleanup
+// removes that file.
 func ResolveAgeIdentity(override string, cfg *config.Config) ([]string, func(), error) {
 	noop := func() {}
 
-	if override == "-" {
-		tmpFile, err := osutils.CreateTempFile("dotpak-identity-*")
-		if err != nil {
-			return nil, noop, fmt.Errorf("creating temp file for identity: %w", err)
+	switch {
+	case override == "-":
+		return stageIdentity(os.Stdin)
+	case override != "":
+		info, err := os.Stat(override)
+		if err == nil && !info.Mode().IsRegular() {
+			src, openErr := os.Open(override)
+			if openErr != nil {
+				return nil, noop, fmt.Errorf("opening identity %s: %w", override, openErr)
+			}
+			defer src.Close()
+			return stageIdentity(src)
 		}
-
-		path := tmpFile.Name()
-		cleanup := func() { _ = os.Remove(path) }
-
-		if _, copyErr := io.Copy(tmpFile, os.Stdin); copyErr != nil {
-			_ = tmpFile.Close()
-			cleanup()
-			return nil, noop, fmt.Errorf("reading identity from stdin: %w", copyErr)
-		}
-		if closeErr := tmpFile.Close(); closeErr != nil {
-			cleanup()
-			return nil, noop, fmt.Errorf("writing identity file: %w", closeErr)
-		}
-
-		return []string{path}, cleanup, nil
-	}
-
-	if override != "" {
 		return []string{override}, noop, nil
+	default:
+		return resolveAgeIdentityFiles(cfg), noop, nil
+	}
+}
+
+// stageIdentity copies a one-shot identity source into a 0600 temp file that
+// can be handed to age as many times as needed.
+func stageIdentity(src io.Reader) ([]string, func(), error) {
+	noop := func() {}
+
+	tmpFile, err := osutils.CreateTempFile("dotpak-identity-*")
+	if err != nil {
+		return nil, noop, fmt.Errorf("creating temp file for identity: %w", err)
 	}
 
-	return resolveAgeIdentityFiles(cfg), noop, nil
+	path := tmpFile.Name()
+	cleanup := func() { _ = os.Remove(path) }
+
+	if _, copyErr := io.Copy(tmpFile, src); copyErr != nil {
+		_ = tmpFile.Close()
+		cleanup()
+		return nil, noop, fmt.Errorf("reading identity: %w", copyErr)
+	}
+	if closeErr := tmpFile.Close(); closeErr != nil {
+		cleanup()
+		return nil, noop, fmt.Errorf("writing identity file: %w", closeErr)
+	}
+
+	return []string{path}, cleanup, nil
 }
 
 // resolveAgeIdentityFor resolves the identity files needed to read archivePath.
