@@ -3,6 +3,7 @@ package crypto
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -186,28 +187,40 @@ func TestMethod_Constants(t *testing.T) {
 	}
 }
 
-func TestAgeEncryptor_FindIdentityFile(t *testing.T) {
+func TestAgeEncryptor_ExistingIdentityFiles(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	identityFile := filepath.Join(tmpDir, "identity.txt")
-	if err := os.WriteFile(identityFile, []byte("AGE-SECRET-KEY-..."), 0600); err != nil {
-		t.Fatalf("failed to create identity file: %v", err)
+	oldIdentity := filepath.Join(tmpDir, "old.txt")
+	newIdentity := filepath.Join(tmpDir, "new.txt")
+	for _, path := range []string{oldIdentity, newIdentity} {
+		if err := os.WriteFile(path, []byte("AGE-SECRET-KEY-..."), 0600); err != nil {
+			t.Fatalf("failed to create identity file: %v", err)
+		}
 	}
 
 	enc := NewAgeEncryptor(Options{
 		AgeIdentityFiles: []string{
 			filepath.Join(tmpDir, "nonexistent.txt"),
-			identityFile,
+			oldIdentity,
+			newIdentity,
 		},
 	})
 
-	found, err := enc.findIdentityFile()
+	found, err := enc.existingIdentityFiles()
 	if err != nil {
-		t.Errorf("unexpected error: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if found != identityFile {
-		t.Errorf("expected %s, got %s", identityFile, found)
+	// every existing identity must be passed: an archive encrypted for the
+	// newer key would not decrypt with only the first one
+	want := []string{oldIdentity, newIdentity}
+	if !slices.Equal(found, want) {
+		t.Errorf("existingIdentityFiles() = %v, want %v", found, want)
+	}
+
+	enc = NewAgeEncryptor(Options{AgeIdentityFiles: []string{filepath.Join(tmpDir, "missing.txt")}})
+	if _, err = enc.existingIdentityFiles(); err == nil {
+		t.Error("expected error when no identity file exists")
 	}
 }
 

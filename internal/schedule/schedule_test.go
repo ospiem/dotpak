@@ -117,6 +117,52 @@ func TestBuildCronCommand(t *testing.T) {
 	}
 }
 
+func TestBuildCronLine(t *testing.T) {
+	t.Parallel()
+
+	got := buildCronLine(15, "/opt/bin:/usr/bin", []string{"/bin/dotpak", "cron", "run"}, "/home/u/backup.log")
+	want := "0 15 * * * { echo '---'; date -Iseconds; PATH=/opt/bin:/usr/bin /bin/dotpak cron run; } " +
+		">> /home/u/backup.log 2>&1 # dotpak"
+	if got != want {
+		t.Errorf("buildCronLine =\n%s\nwant\n%s", got, want)
+	}
+
+	// '%' becomes a newline in crontab unless backslash-escaped, quoting or not
+	got = buildCronLine(3, "/usr/bin", []string{"/opt/100%/dotpak", "cron", "run"}, "/var/log/50% full.log")
+	if strings.Contains(strings.ReplaceAll(got, `\%`, ""), "%") {
+		t.Errorf("unescaped %% in cron line: %s", got)
+	}
+	if !strings.Contains(got, `/opt/100\%/dotpak`) || !strings.Contains(got, `'/var/log/50\% full.log'`) {
+		t.Errorf("expected escaped %% in paths: %s", got)
+	}
+}
+
+func TestAbsoluteConfigPath(t *testing.T) {
+	t.Parallel()
+
+	got, err := absoluteConfigPath("")
+	if err != nil || got != "" {
+		t.Errorf("absoluteConfigPath(\"\") = %q, %v; want empty", got, err)
+	}
+
+	got, err = absoluteConfigPath("./work.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd, _ := os.Getwd()
+	if want := filepath.Join(cwd, "work.toml"); got != want {
+		t.Errorf("absoluteConfigPath(./work.toml) = %q, want %q", got, want)
+	}
+
+	got, err = absoluteConfigPath("~/dotpak.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(got) || strings.HasPrefix(got, "~") {
+		t.Errorf("absoluteConfigPath(~/dotpak.toml) = %q, want expanded absolute path", got)
+	}
+}
+
 func TestBackupArgs(t *testing.T) {
 	t.Parallel()
 

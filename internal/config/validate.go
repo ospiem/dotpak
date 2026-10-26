@@ -14,6 +14,10 @@ import (
 func Validate(cfg *Config) error {
 	var issues []string
 
+	for _, key := range cfg.UnknownKeys {
+		issues = append(issues, fmt.Sprintf("unknown key %q (typo? it has no effect)", key))
+	}
+
 	backupDir := strings.TrimSpace(cfg.Backup.BackupDir)
 	if backupDir == "" {
 		issues = append(issues, "backup.backup_dir is required")
@@ -33,7 +37,7 @@ func Validate(cfg *Config) error {
 	}
 
 	switch cfg.Backup.Encryption {
-	case "age", "gpg", "none", "":
+	case "age", "gpg", EncryptionNone, "":
 	default:
 		issues = append(
 			issues,

@@ -120,36 +120,85 @@ func New(cfg *config.Config, opts *Options, out *output.Output) (*Restore, error
 	}, nil
 }
 
-// sensitivePatterns are path prefixes that indicate sensitive files.
-var sensitivePatterns = []string{
+// builtinSensitivePrefixes is the floor of what counts as sensitive even when
+// the config trimmed its sensitive list.
+var builtinSensitivePrefixes = []string{
 	".ssh", ".gnupg", ".aws", ".config/gcloud", ".azure",
-	".kube", ".terraform", ".docker", ".pypirc",
+	".kube", ".terraform", ".terraformrc", ".docker", ".pypirc",
 }
 
-// containsSensitiveFiles checks if any files match sensitive patterns.
-func (r *Restore) containsSensitiveFiles(files []string) bool {
-	for _, file := range files {
-		for _, pattern := range sensitivePatterns {
-			if strings.HasPrefix(file, pattern) {
-				return true
-			}
+// sensitivePrefixes returns the home-relative prefixes marking a file as
+// sensitive: everything the config lists as sensitive plus the built-in floor.
+func (r *Restore) sensitivePrefixes() []string {
+	prefixes := slices.Clone(builtinSensitivePrefixes)
+	if r.cfg != nil {
+		prefixes = append(prefixes, r.cfg.Sensitive...)
+	}
+	return prefixes
+}
+
+// isSensitivePath reports whether file is one of the prefixes or lives under
+// one of them (so ".ssh" covers ".ssh/config" but not ".sshrc").
+func isSensitivePath(file string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		prefix = strings.TrimSuffix(prefix, "/")
+		if prefix == "" || prefix == "." {
+			continue
+		}
+		if file == prefix || strings.HasPrefix(file, prefix+"/") {
+			return true
 		}
 	}
 	return false
 }
 
+// containsSensitiveFiles checks if any files match sensitive patterns.
+func (r *Restore) containsSensitiveFiles(files []string) bool {
+	prefixes := r.sensitivePrefixes()
+	return slices.ContainsFunc(files, func(file string) bool {
+		return isSensitivePath(file, prefixes)
+	})
+}
+
+// supportsMethod reports whether the config and installed tools can encrypt
+// with method.
+func (r *Restore) supportsMethod(method crypto.Method) bool {
+	switch method {
+	case crypto.MethodAge:
+		if r.cfg.Backup.AgeRecipients == "" || !crypto.HasAge() {
+			return false
+		}
+		_, err := os.Stat(r.cfg.Backup.AgeRecipients)
+		return err == nil
+	case crypto.MethodGPG:
+		return r.cfg.Backup.GPGRecipient != "" && crypto.HasGPG()
+	case crypto.MethodNone:
+		return false
+	default:
+		return false
+	}
+}
+
 // configEncryptionMethod returns the encryption method usable with the current
 // config and installed tools, or MethodNone.
 func (r *Restore) configEncryptionMethod() crypto.Method {
-	if r.cfg.Backup.AgeRecipients != "" && crypto.HasAge() {
-		if _, err := os.Stat(r.cfg.Backup.AgeRecipients); err == nil {
-			return crypto.MethodAge
+	for _, method := range []crypto.Method{crypto.MethodAge, crypto.MethodGPG} {
+		if r.supportsMethod(method) {
+			return method
 		}
 	}
-	if r.cfg.Backup.GPGRecipient != "" && crypto.HasGPG() {
-		return crypto.MethodGPG
-	}
 	return crypto.MethodNone
+}
+
+// usableEncryption returns preferred when this machine can encrypt with it,
+// otherwise whatever the config supports (possibly MethodNone). A fresh
+// machine restoring an encrypted archive typically has the identity to
+// decrypt but no recipients configured yet.
+func (r *Restore) usableEncryption(preferred crypto.Method) crypto.Method {
+	if preferred != crypto.MethodNone && r.supportsMethod(preferred) {
+		return preferred
+	}
+	return r.configEncryptionMethod()
 }
 
 // promptForSensitiveBackup prompts the user for how to handle sensitive files in the safety backup
@@ -190,16 +239,10 @@ func (r *Restore) promptForSensitiveBackup(files []string) ([]string, error) {
 
 // filterSensitiveFiles removes sensitive files from the list.
 func (r *Restore) filterSensitiveFiles(files []string) []string {
+	prefixes := r.sensitivePrefixes()
 	var filtered []string
 	for _, file := range files {
-		isSensitive := false
-		for _, pattern := range sensitivePatterns {
-			if strings.HasPrefix(file, pattern) {
-				isSensitive = true
-				break
-			}
-		}
-		if !isSensitive {
+		if !isSensitivePath(file, prefixes) {
 			filtered = append(filtered, file)
 		}
 	}
@@ -236,6 +279,16 @@ func (r *Restore) Run(archivePath string) (*metadata.RestoreResult, error) {
 	}
 	defer cleanup()
 	r.identityFiles = identityFiles
+
+	// the safety-backup scan already reads the whole stream and so carries the
+	// decryption verdict; without it, verify first so a truncated or tampered
+	// encrypted archive is rejected before any file is overwritten
+	if r.opts.NoBackup && !r.opts.DryRun && crypto.IsEncryptedPath(archivePath) {
+		r.out.Verbose("Verifying archive...\n")
+		if err := r.verifyArchive(archivePath); err != nil {
+			return fail(result, fmt.Errorf("archive verification failed: %w", err))
+		}
+	}
 
 	if !r.opts.NoBackup && !r.opts.DryRun {
 		safetyPath, err := r.createSafetyBackup(archivePath)
@@ -287,10 +340,11 @@ func (r *Restore) createSafetyBackup(archivePath string) (string, error) {
 
 	// encrypt if the source archive was encrypted; sensitive files also get
 	// the config's encryption even when the source archive was plaintext
-	method := crypto.DetectMethod(archivePath)
+	sourceMethod := crypto.DetectMethod(archivePath)
 	sensitive := r.containsSensitiveFiles(filesToBackup)
-	if method == crypto.MethodNone && sensitive {
-		method = r.configEncryptionMethod()
+	method := crypto.MethodNone
+	if sourceMethod != crypto.MethodNone || sensitive {
+		method = r.usableEncryption(sourceMethod)
 	}
 
 	if sensitive && method == crypto.MethodNone {
@@ -302,6 +356,11 @@ func (r *Restore) createSafetyBackup(archivePath string) (string, error) {
 			r.out.Verbose("No files to backup after filtering\n")
 			return "", nil
 		}
+	}
+
+	if method == crypto.MethodNone && sourceMethod != crypto.MethodNone {
+		r.out.Warning("Source archive is encrypted but no usable encryption is configured; " +
+			"writing the safety backup unencrypted\n")
 	}
 
 	preRestoreDir := filepath.Join(r.cfg.Backup.BackupDir, "pre-restore")
@@ -361,6 +420,17 @@ func (r *Restore) writeSafetyArchive(w io.Writer, filesToBackup []string) error 
 		}
 		return nil
 	})
+}
+
+// verifyArchive reads the whole decrypted stream without writing anything so
+// that the decryption verdict is known before extraction touches any file.
+func (r *Restore) verifyArchive(archivePath string) error {
+	rc, err := openArchiveStream(archivePath, r.identityFiles)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(io.Discard, rc)
+	return closeArchiveStream(rc, copyErr)
 }
 
 func (r *Restore) findFilesToBackup(archivePath string) ([]string, error) {
@@ -522,15 +592,9 @@ func (r *Restore) extractStream(stream io.Reader) (int, error) {
 			count++
 
 		case tar.TypeSymlink:
-			if !isSafePath(header.Linkname) {
-				r.out.Warning("Skipping symlink with unsafe target: %s -> %s\n", header.Name, header.Linkname)
-				unsafeSkipped++
-				continue
-			}
-			// defense-in-depth: verify resolved symlink target is within home
-			//nolint:gosec // g305: path validated by isPathWithinBase() immediately below
-			resolvedTarget := filepath.Join(filepath.Dir(targetPath), header.Linkname)
-			if !isPathWithinBase(resolvedTarget, r.homeDir) {
+			// the target may be absolute or climb with ".." (dotfiles repos
+			// are commonly linked that way); what matters is where it lands
+			if !symlinkTargetWithinHome(targetPath, header.Linkname, r.homeDir, resolvedHome) {
 				r.out.Warning("Skipping symlink that escapes home: %s -> %s\n", header.Name, header.Linkname)
 				unsafeSkipped++
 				continue
@@ -608,6 +672,27 @@ func isSafePath(path string) bool {
 		return false
 	}
 	return true
+}
+
+// symlinkTargetWithinHome reports whether a symlink created at linkPath with
+// the archive's linkname would point inside the home directory. home and
+// resolvedHome are both accepted because an absolute target may spell either
+// form (/var/... vs /private/var/... on macOS).
+//
+// A lexical check is sufficient here: creating the link writes nothing at the
+// target, and every later write resolves its parent directories with
+// EvalSymlinks (ensureParentWithinHome), so a link cannot redirect extraction
+// outside home even if it passes through another symlink.
+func symlinkTargetWithinHome(linkPath, linkname, home, resolvedHome string) bool {
+	if linkname == "" || strings.ContainsRune(linkname, '\x00') {
+		return false
+	}
+	target := linkname
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(linkPath), target)
+	}
+	target = filepath.Clean(target)
+	return isPathWithinBase(target, home) || isPathWithinBase(target, resolvedHome)
 }
 
 // isPathWithinBase validates that targetPath is lexically within baseDir.
@@ -810,8 +895,12 @@ func showDiffStream(stream io.Reader, home string, verbose bool, out *output.Out
 		if header.Typeflag != tar.TypeReg {
 			continue
 		}
+		if !isSafePath(header.Name) {
+			out.Warning("Skipping unsafe path: %s\n", header.Name)
+			continue
+		}
 
-		//nolint:gosec // g305: path used only for stat comparison, no extraction
+		//nolint:gosec // g305: path validated by isSafePath() above, used only for comparison
 		currentPath := filepath.Join(home, header.Name)
 
 		currentInfo, statErr := os.Stat(currentPath)

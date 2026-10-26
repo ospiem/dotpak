@@ -35,14 +35,7 @@ func installLinuxCron(hour int, configFile string, out *output.Output) error {
 		currentPath = "/usr/local/bin:/usr/bin:/bin"
 	}
 
-	cronCmd := buildCronCommand(backupArgs(execPath, configFile))
-	logFile := shellQuote(filepath.Join(logDir, "backup.log"))
-	// use shell group to add timestamp before each run, combine stdout/stderr
-	cronLine := fmt.Sprintf(
-		"0 %d * * * { echo '---'; date -Iseconds; %s; } >> %s 2>&1 %s",
-		hour, cronCmd, logFile, linuxCronMarker,
-	)
-	pathLine := fmt.Sprintf("PATH=%s %s", currentPath, linuxCronMarker)
+	cronLine := buildCronLine(hour, currentPath, backupArgs(execPath, configFile), filepath.Join(logDir, "backup.log"))
 
 	existing, err := readCrontab()
 	if err != nil {
@@ -50,7 +43,7 @@ func installLinuxCron(hour int, configFile string, out *output.Output) error {
 	}
 
 	lines, _ := filterDotpakCron(existing)
-	lines = append(lines, pathLine, cronLine)
+	lines = append(lines, cronLine)
 
 	if err = writeCrontab(strings.Join(lines, "\n") + "\n"); err != nil {
 		return err
@@ -118,12 +111,30 @@ func linuxCronStatus(out *output.Output) error {
 	return nil
 }
 
+// buildCronLine renders the crontab entry. PATH is set as a prefix assignment
+// inside the command rather than as a crontab environment line: crontab(5)
+// forbids comments on environment lines, so the "# dotpak" marker would have
+// become part of PATH. The shell group adds a timestamp before each run and
+// combines stdout/stderr into the log file.
+func buildCronLine(hour int, pathEnv string, args []string, logFile string) string {
+	command := fmt.Sprintf("{ echo '---'; date -Iseconds; PATH=%s %s; } >> %s 2>&1",
+		shellQuote(pathEnv), buildCronCommand(args), shellQuote(logFile))
+	return fmt.Sprintf("0 %d * * * %s %s", hour, cronEscape(command), linuxCronMarker)
+}
+
 func buildCronCommand(args []string) string {
 	quoted := make([]string, 0, len(args))
 	for _, arg := range args {
 		quoted = append(quoted, shellQuote(arg))
 	}
 	return strings.Join(quoted, " ")
+}
+
+// cronEscape protects '%' in a crontab command: cron turns an unescaped '%'
+// into a newline and feeds the rest to the command's stdin, and quoting does
+// not stop it. The backslash is stripped by cron before the shell runs.
+func cronEscape(command string) string {
+	return strings.ReplaceAll(command, "%", `\%`)
 }
 
 func readCrontab() (string, error) {

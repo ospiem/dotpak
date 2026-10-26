@@ -2,21 +2,19 @@ package backup
 
 import (
 	"archive/tar"
+	"errors"
 	"io"
 	"os"
 
 	"github.com/ospiem/dotpak/internal/archive"
 	"github.com/ospiem/dotpak/internal/crypto"
+	"github.com/ospiem/dotpak/internal/metadata"
 )
-
-// partialSuffix marks in-progress archives so an interrupted backup never
-// leaves a truncated file at the final path.
-const partialSuffix = ".partial"
 
 // createArchive creates a tar.gz archive atomically: the stream is written to
 // a temporary sibling and renamed into place only on success.
 func (b *Backup) createArchive(archivePath string, files []FileInfo) error {
-	tmpPath := archivePath + partialSuffix
+	tmpPath := archivePath + metadata.PartialSuffix
 
 	// create output file with restricted permissions
 	outFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
@@ -40,7 +38,7 @@ func (b *Backup) createArchive(archivePath string, files []FileInfo) error {
 // so that unencrypted data never touches disk. The encrypted output is also
 // written to a temporary sibling and renamed into place on success.
 func (b *Backup) createEncryptedArchive(outputPath string, files []FileInfo, enc crypto.Encryptor) error {
-	tmpPath := outputPath + partialSuffix
+	tmpPath := outputPath + metadata.PartialSuffix
 
 	if err := archive.EncryptStream(enc, tmpPath, func(w io.Writer) error {
 		return b.writeArchive(w, files)
@@ -60,12 +58,17 @@ func (b *Backup) writeArchive(w io.Writer, files []FileInfo) error {
 		for i, f := range files {
 			b.out.Progress(i+1, len(files), f.RelPath)
 
-			if addErr := archive.AddFileToTar(tw, f.FullPath, f.RelPath); addErr != nil {
+			addErr := archive.AddFileToTar(tw, f.FullPath, f.RelPath)
+			switch {
+			case errors.Is(addErr, archive.ErrTruncated):
+				b.out.Warning("%v\n", addErr)
+				added++
+			case addErr != nil:
 				b.out.Warning("Skipping %s: %v\n", f.RelPath, addErr)
 				b.stats.FilesSkipped++
-				continue
+			default:
+				added++
 			}
-			added++
 		}
 
 		b.out.ClearProgress()
