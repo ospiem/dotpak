@@ -38,6 +38,7 @@ func installLaunchd(hour int, configFile string, out *output.Output) error {
 	if currentPath == "" {
 		currentPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 	}
+	lang := scheduledLang()
 
 	var argsXML strings.Builder
 	for _, arg := range backupArgs(resolvedPath, configFile) {
@@ -56,6 +57,11 @@ func installLaunchd(hour int, configFile string, out *output.Output) error {
 	escapedHome, err := xmlEscapeText(home)
 	if err != nil {
 		return fmt.Errorf("escaping HOME: %w", err)
+	}
+
+	escapedLang, err := xmlEscapeText(lang)
+	if err != nil {
+		return fmt.Errorf("escaping LANG: %w", err)
 	}
 
 	plistContent := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
@@ -80,10 +86,12 @@ func installLaunchd(hour int, configFile string, out *output.Output) error {
         <string>%s</string>
         <key>PATH</key>
         <string>%s</string>
+        <key>LANG</key>
+        <string>%s</string>
     </dict>
 </dict>
 </plist>
-`, launchdLabel, argsXML.String(), hour, escapedHome, escapedPath)
+`, launchdLabel, argsXML.String(), hour, escapedHome, escapedPath, escapedLang)
 
 	if err = os.MkdirAll(filepath.Join(home, "Library", "LaunchAgents"), 0755); err != nil {
 		return fmt.Errorf("creating LaunchAgents directory: %w", err)

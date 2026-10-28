@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-10-26
+
+### Fixed
+
+- Scheduled jobs get `LANG` (the installing shell's, or `en_US.UTF-8`) in the launchd plist and the cron command: launchd and cron start without a locale, and `age-plugin-yubikey` panics on macOS when `LANG` is unset, so a backup encrypted to a YubiKey recipient failed unattended even though wrapping to a recipient never needs the token. Reinstall with `dotpak cron install`
+
 ## [0.5.0] - 2026-10-26
 
 ### Security

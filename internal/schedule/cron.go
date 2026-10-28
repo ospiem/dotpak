@@ -35,7 +35,8 @@ func installLinuxCron(hour int, configFile string, out *output.Output) error {
 		currentPath = "/usr/local/bin:/usr/bin:/bin"
 	}
 
-	cronLine := buildCronLine(hour, currentPath, backupArgs(execPath, configFile), filepath.Join(logDir, "backup.log"))
+	cronLine := buildCronLine(hour, currentPath, scheduledLang(), backupArgs(execPath, configFile),
+		filepath.Join(logDir, "backup.log"))
 
 	existing, err := readCrontab()
 	if err != nil {
@@ -111,14 +112,14 @@ func linuxCronStatus(out *output.Output) error {
 	return nil
 }
 
-// buildCronLine renders the crontab entry. PATH is set as a prefix assignment
-// inside the command rather than as a crontab environment line: crontab(5)
-// forbids comments on environment lines, so the "# dotpak" marker would have
-// become part of PATH. The shell group adds a timestamp before each run and
-// combines stdout/stderr into the log file.
-func buildCronLine(hour int, pathEnv string, args []string, logFile string) string {
-	command := fmt.Sprintf("{ echo '---'; date -Iseconds; PATH=%s %s; } >> %s 2>&1",
-		shellQuote(pathEnv), buildCronCommand(args), shellQuote(logFile))
+// buildCronLine renders the crontab entry. PATH and LANG are set as prefix
+// assignments inside the command rather than as crontab environment lines:
+// crontab(5) forbids comments on environment lines, so the "# dotpak" marker
+// would have become part of the value. The shell group adds a timestamp
+// before each run and combines stdout/stderr into the log file.
+func buildCronLine(hour int, pathEnv, lang string, args []string, logFile string) string {
+	command := fmt.Sprintf("{ echo '---'; date -Iseconds; PATH=%s LANG=%s %s; } >> %s 2>&1",
+		shellQuote(pathEnv), shellQuote(lang), buildCronCommand(args), shellQuote(logFile))
 	return fmt.Sprintf("0 %d * * * %s %s", hour, cronEscape(command), linuxCronMarker)
 }
 

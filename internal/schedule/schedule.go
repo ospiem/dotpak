@@ -94,6 +94,21 @@ func absoluteConfigPath(configFile string) (string, error) {
 	return abs, nil
 }
 
+// defaultLang is the locale given to scheduled jobs when the installing shell
+// has none.
+const defaultLang = "en_US.UTF-8"
+
+// scheduledLang returns the LANG to hand to the scheduled job. launchd and
+// cron start with no locale at all, and age-plugin-yubikey panics on macOS
+// when LANG is unset — so a backup encrypted to a YubiKey recipient fails
+// unattended even though wrapping to a recipient never needs the token.
+func scheduledLang() string {
+	if lang := os.Getenv("LANG"); lang != "" {
+		return lang
+	}
+	return defaultLang
+}
+
 // backupArgs builds the scheduled command line: dotpak cron run [--config path].
 func backupArgs(execPath, configFile string) []string {
 	if configFile != "" {

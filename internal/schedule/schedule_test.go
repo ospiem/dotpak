@@ -120,20 +120,32 @@ func TestBuildCronCommand(t *testing.T) {
 func TestBuildCronLine(t *testing.T) {
 	t.Parallel()
 
-	got := buildCronLine(15, "/opt/bin:/usr/bin", []string{"/bin/dotpak", "cron", "run"}, "/home/u/backup.log")
-	want := "0 15 * * * { echo '---'; date -Iseconds; PATH=/opt/bin:/usr/bin /bin/dotpak cron run; } " +
+	got := buildCronLine(15, "/opt/bin:/usr/bin", "en_US.UTF-8", []string{"/bin/dotpak", "cron", "run"},
+		"/home/u/backup.log")
+	want := "0 15 * * * { echo '---'; date -Iseconds; PATH=/opt/bin:/usr/bin LANG=en_US.UTF-8 /bin/dotpak cron run; } " +
 		">> /home/u/backup.log 2>&1 # dotpak"
 	if got != want {
 		t.Errorf("buildCronLine =\n%s\nwant\n%s", got, want)
 	}
 
 	// '%' becomes a newline in crontab unless backslash-escaped, quoting or not
-	got = buildCronLine(3, "/usr/bin", []string{"/opt/100%/dotpak", "cron", "run"}, "/var/log/50% full.log")
+	got = buildCronLine(3, "/usr/bin", "C.UTF-8", []string{"/opt/100%/dotpak", "cron", "run"}, "/var/log/50% full.log")
 	if strings.Contains(strings.ReplaceAll(got, `\%`, ""), "%") {
 		t.Errorf("unescaped %% in cron line: %s", got)
 	}
 	if !strings.Contains(got, `/opt/100\%/dotpak`) || !strings.Contains(got, `'/var/log/50\% full.log'`) {
 		t.Errorf("expected escaped %% in paths: %s", got)
+	}
+}
+
+func TestScheduledLang(t *testing.T) {
+	t.Setenv("LANG", "")
+	if got := scheduledLang(); got != defaultLang {
+		t.Errorf("scheduledLang() with LANG unset = %q, want %q", got, defaultLang)
+	}
+	t.Setenv("LANG", "ru_RU.UTF-8")
+	if got := scheduledLang(); got != "ru_RU.UTF-8" {
+		t.Errorf("scheduledLang() = %q, want the shell's LANG", got)
 	}
 }
 
