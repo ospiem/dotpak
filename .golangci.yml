@@ -239,7 +239,14 @@ linters:
       # Default: [ switch ]
       check:
         - switch
-        - map
+        - mapliteral
+
+    gosec:
+      # Taint-analysis rules flag every exec/os.Stat/WriteFile whose argument
+      # comes from config or $HOME; everything here does, by design.
+      excludes:
+        - G702
+        - G703
 
     exhaustruct:
       # List of regular expressions to match type names that should be excluded from processing.

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Build with Go 1.27.3 (`go` directive bumped from 1.26.5); CI and release workflows use Go 1.27 and golangci-lint v2.15.0; indirect dependencies updated (`golang.org/x/sys` v0.49.0, `go-colorable` v0.1.16)
+
 ## [0.5.1] - 2026-10-26
 
 ### Fixed
